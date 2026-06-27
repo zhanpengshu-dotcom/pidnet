@@ -2,6 +2,8 @@ data/
 output/
 log/
 pretrained_models/
+figs/
+samples/
 *.pt
 *.pth
 *.pth.tar
