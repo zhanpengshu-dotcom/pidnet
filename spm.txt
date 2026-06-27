@@ -1,0 +1,350 @@
+请基于当前 PIDNet 项目，帮我完成 SPM 模块的增加与版本管理。重点不是重新设计网络，而是检查 SPM 实现是否正确，并设计最合理的 SPM 插入位置消融。
+
+我的项目任务是五分类输电通道语义分割：
+
+```text
+0 background
+1 powerline
+2 tower_wooden
+3 tower_lattice
+4 tower_tucohy
+255 ignore
+```
+
+当前最优 baseline 是：
+
+```text
+PIDNet-S + cw2 class_weights + ID2/ID4 数据增强
+```
+
+当前主要问题集中在输电线：
+
+```text
+1. 局部断线；
+2. 多根输电线黏连、变粗；
+3. 边缘不清晰、毛躁；
+4. 道路裂缝、植被边缘、阴影、建筑纹理等线状背景误检；
+5. 弱对比细线漏检。
+```
+
+杆塔问题已经减少，但仍有局部边缘不清晰、细杆/横担漏分、局部结构不完整等问题。
+
+本次只做 SPM，不加入 ODConv、Sobel loss、MCC loss 或其他模块。
+
+---
+
+## 一、检查当前已有 SPM 版本
+
+我目前已有一个版本：
+
+```text
+models/pidnet_v2.py
+```
+
+该版本中 SPM 加在 D branch 深层输出后，大致结构是：
+
+```python
+x_d = self.layer5_d(self.relu(x_d))
+x_d = self.spm(x_d)
+x_ = self.final_layer(self.dfm(x_, x, x_d))
+```
+
+并在 `__init__` 中加入：
+
+```python
+self.spm = StripPooling(planes * 4)
+```
+
+请检查这个实现是否正确，重点检查：
+
+```text
+1. layer5_d 输出通道是否确实等于 planes * 4；
+2. StripPooling(planes * 4) 输入输出 shape 是否保持一致；
+3. SPM 是否有残差连接，是否不会破坏原特征；
+4. self.spm.fuse[1] 是否确实是 BN 层；
+5. 如果对 BN gamma/bias 置零初始化，是否会被后续全局初始化覆盖；
+6. augment=True 和 augment=False 两种 forward 是否都能正常输出；
+7. dummy input 测试是否通过：
+   x = torch.randn(1, 3, 512, 512)
+8. 输出 shape 是否与原始 PIDNet-S 一致；
+9. 参数量和 FLOPs 相比 baseline 增加多少。
+```
+
+如果当前 `pidnet_v2.py` 的 SPM 实现存在问题，请指出具体问题并修正。
+
+---
+
+## 二、设计两个 SPM 版本
+
+### 版本 1：D-SPM
+
+保留当前思路，即 SPM 放在 D branch 深层输出后。
+
+建议版本命名：
+
+```text
+models/pidnet_v2_1.py
+```
+
+结构为：
+
+```python
+x_d = self.layer5_d(self.relu(x_d))
+x_d = self.spm_d(x_d)
+x_ = self.final_layer(self.dfm(x_, x, x_d))
+```
+
+要求：
+
+```text
+1. 只在 D branch layer5_d 后加入 SPM；
+2. 不修改 P branch；
+3. 不修改 I branch；
+4. 不修改 final_layer；
+5. 不加入 ODConv；
+6. 不加入 Sobel loss；
+7. 不加入 MCC loss；
+8. 保证输出 shape 与 baseline 一致；
+9. 保证新增 SPM 参数被 checkpoint 正常保存；
+10. 输出参数量和 FLOPs。
+```
+
+该版本用于验证：
+
+```text
+SPM 放在 D branch 末端，是否能改善输电线边界连续性、细长结构边界和杆塔局部边缘。
+```
+
+---
+
+### 版本 2：SPM-Fuse
+
+新增一个位置消融版本，SPM 放在 `dfm` 融合之后、`final_layer` 之前。
+
+建议版本命名：
+
+```text
+models/pidnet_v2_2.py
+```
+
+原始结构：
+
+```python
+x_ = self.final_layer(self.dfm(x_, x, x_d))
+```
+
+修改为：
+
+```python
+x_ = self.dfm(x_, x, x_d)
+x_ = self.spm_fuse(x_)
+x_ = self.final_layer(x_)
+```
+
+要求：
+
+```text
+1. 不在 D branch 中加入 SPM；
+2. 只在 dfm 融合特征后加入 SPM；
+3. 检查 self.dfm(x_, x, x_d) 的输出通道数；
+4. 根据 dfm 输出通道设置：
+   self.spm_fuse = StripPooling(dfm_output_channels)
+5. 确保 spm_fuse 输出通道与 final_layer 输入通道一致；
+6. 不修改 P branch；
+7. 不修改 I branch；
+8. 不修改 D branch；
+9. 不加入 ODConv；
+10. 不加入 Sobel loss；
+11. 不加入 MCC loss；
+12. dummy input 测试通过；
+13. 输出参数量和 FLOPs。
+```
+
+该版本用于验证：
+
+```text
+SPM 放在最终融合语义特征后，是否比 D-SPM 更适合改善五分类最终 mask，尤其是输电线连续性、误检控制和杆塔局部结构。
+```
+
+---
+
+## 三、SPM 模块实现要求
+
+请检查或实现 `StripPooling`，要求：
+
+```text
+1. 输入输出尺寸一致；
+2. 输入输出通道一致；
+3. 支持任意 batch size；
+4. 支持 512×512 输入下 PIDNet 各阶段 feature shape；
+5. 不显著增加参数量；
+6. 不改变 PIDNet-S 的轻量化特性；
+7. 最好采用残差形式：
+   out = x + spm_branch(x)
+8. 如果使用 BN 零初始化，需要确认初始化顺序正确。
+```
+
+如果当前 `StripPooling` 太重，请给出轻量化版本。
+
+---
+
+## 四、版本管理方式
+
+我训练前会手动切换版本文件。
+
+具体方式是：
+
+```text
+1. 复制某个版本模型文件；
+2. 手动覆盖 models/pidnet.py；
+3. 必要时手动覆盖 models/model_utils.py；
+4. 使用对应 yaml 训练。
+```
+
+因此请按这个方式设计版本文件。
+
+请生成或检查以下文件：
+
+```text
+models/pidnet_v2_1.py        # D-SPM
+models/pidnet_v2_2.py        # SPM-Fuse
+models/model_utils_v2_1.py   # 对应 D-SPM，如有必要
+models/model_utils_v2_2.py   # 对应 SPM-Fuse，如有必要
+```
+
+训练时我会手动执行类似操作：
+
+```text
+把 models/pidnet_v2_1.py 复制为 models/pidnet.py
+把 models/model_utils_v2_1.py 复制为 models/model_utils.py
+使用 pidnet_small_local_5_cw3_spm_d.yaml 训练
+```
+
+或：
+
+```text
+把 models/pidnet_v2_2.py 复制为 models/pidnet.py
+把 models/model_utils_v2_2.py 复制为 models/model_utils.py
+使用 pidnet_small_local_5_cw3_spm_fuse.yaml 训练
+```
+
+请重点检查 `model_utils.py` 的 import 是否正确。
+
+如果 `model_utils.py` 中本来就是：
+
+```python
+from models.pidnet import PIDNet
+```
+
+那么手动覆盖 `pidnet.py` 后，`model_utils.py` 可以尽量保持不变。
+
+如果 `model_utils.py` 中写死了其他模型名或存在额外注册逻辑，请指出需要同步修改的位置。
+
+---
+
+## 五、yaml 版本管理
+
+请为两个 SPM 版本设计 yaml 命名和关键字段。
+
+建议：
+
+```text
+configs/power/pidnet_small_local_5_cw3_spm_d.yaml
+configs/power/pidnet_small_local_5_cw3_spm_fuse.yaml
+```
+
+两个 yaml 除了实验名、输出目录、模型名外，其他训练配置应和 cw3 baseline 保持一致。
+
+需要检查或设置：
+
+```yaml
+MODEL:
+  NAME: pidnet_small_local_5_cw3_spm_d
+
+DATASET:
+  NUM_CLASSES: 5
+  TRAIN_SET: 增强后的 train list
+  TEST_SET: list/val.txt
+
+TRAIN:
+  END_EPOCH: 300
+  LR: 与 cw3 baseline 一致
+  BATCH_SIZE_PER_GPU: 与 cw3 baseline 一致
+
+OUTPUT_DIR:
+  output/custom/pidnet_small_local_5_cw3_spm_d
+```
+
+另一个版本：
+
+```yaml
+MODEL:
+  NAME: pidnet_small_local_5_cw3_spm_fuse
+
+OUTPUT_DIR:
+  output/custom/pidnet_small_local_5_cw3_spm_fuse
+```
+
+请确保不会覆盖 cw3 baseline、D-SPM、SPM-Fuse 之间的训练输出。
+
+---
+
+## 六、训练前必须验证
+
+请给出一个最小测试脚本或命令，验证当前手动覆盖后的模型是否正确。
+
+测试内容：
+
+```text
+1. 当前 models/pidnet.py 是否是目标版本；
+2. 当前 model_utils.py 是否能正确 import PIDNet；
+3. dummy input forward 是否成功；
+4. augment=True 和 augment=False 是否正常；
+5. 输出 shape 是否和 baseline 一致；
+6. 新增 SPM 参数是否出现在 model.named_parameters() 中；
+7. 参数量是否正常；
+8. FLOPs 是否正常。
+```
+
+dummy input：
+
+```python
+x = torch.randn(1, 3, 512, 512)
+```
+
+---
+
+## 七、训练后提醒
+
+训练完成后，推理 best.pt 时必须保持模型文件一致：
+
+```text
+如果训练时使用 pidnet_v2_1.py 覆盖 pidnet.py，
+推理时也必须使用同一个 D-SPM 版本覆盖 pidnet.py。
+
+如果训练时使用 pidnet_v2_2.py 覆盖 pidnet.py，
+推理时也必须使用同一个 SPM-Fuse 版本覆盖 pidnet.py。
+```
+
+否则 best.pt 权重加载可能出现 missing keys，或者推理结果错误。
+
+---
+
+## 八、最终请输出
+
+请最终给出：
+
+```text
+1. 当前 pidnet_v2.py 的 SPM 实现是否正确；
+2. D-SPM 版本 pidnet_v2_1.py 的修改方案；
+3. SPM-Fuse 版本 pidnet_v2_2.py 的修改方案；
+4. model_utils.py 是否需要修改；
+5. 如果需要，给出 model_utils_v2_1.py 和 model_utils_v2_2.py；
+6. 两个 yaml 文件的建议命名和关键字段；
+7. dummy input 测试代码；
+8. 参数量和 FLOPs 统计代码；
+9. 训练前检查清单；
+10. 推理前检查清单。
+```
+
+本次只做 SPM 模块，不要加入 ODConv、Sobel loss、MCC loss 或其他改动。

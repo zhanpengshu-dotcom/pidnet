@@ -1,0 +1,13 @@
+data/
+output/
+log/
+pretrained_models/
+*.pt
+*.pth
+*.pth.tar
+*.pkl
+*.onnx
+__pycache__/
+*.pyc
+.runs/
+runs/

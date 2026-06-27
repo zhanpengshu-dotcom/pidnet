@@ -1,0 +1,69 @@
+# PIDNet-Large v2 config for A100 80GB server
+# Cityscapes pretrained, tuned for power line segmentation
+#
+# Changes from v1 (pidnet_large_a100.yaml):
+#   - Pretrained: Cityscapes (was ImageNet)
+#   - SB_WEIGHTS: 0.1 (was 0.5)
+#   - OHEMTHRES: 0.9 (was 0.7)
+#   - END_EPOCH: 400 (was 300)
+#   - WORKERS: 8 (was 4)
+
+CUDNN:
+  BENCHMARK: true
+  DETERMINISTIC: false
+  ENABLED: true
+GPUS: (0,)
+OUTPUT_DIR: 'output'
+LOG_DIR: 'log'
+WORKERS: 8
+PRINT_FREQ: 100
+
+DATASET:
+  DATASET: custom
+  ROOT: 'data/PIDNet_Power_Dataset'
+  TEST_SET: 'list/val.txt'
+  TRAIN_SET: 'list/train.txt'
+  NUM_CLASSES: 3
+
+MODEL:
+  NAME: pidnet_l
+  NUM_OUTPUTS: 2
+  # Download PIDNet_L_Cityscapes_val.pt from https://github.com/XuJiacong/PIDNet
+  # Place in pretrained_models/cityscapes/
+  PRETRAINED: 'pretrained_models/cityscapes/PIDNet_L_Cityscapes_val.pt'
+
+LOSS:
+  USE_OHEM: true
+  OHEMTHRES: 0.9
+  OHEMKEEP: 200000
+  BALANCE_WEIGHTS: [0.4, 1.0]
+  SB_WEIGHTS: 0.1
+
+TRAIN:
+  IMAGE_SIZE:
+  - 512
+  - 512
+  BASE_SIZE: 640
+  # PIDNet-L + 512x512 + batch=64 ~ 32GB VRAM
+  BATCH_SIZE_PER_GPU: 64
+  SHUFFLE: true
+  BEGIN_EPOCH: 0
+  END_EPOCH: 300
+  IGNORE_LABEL: 255
+  OPTIMIZER: sgd
+  LR: 0.01
+  WD: 0.0005
+  MOMENTUM: 0.9
+  NESTEROV: false
+  FLIP: true
+  MULTI_SCALE: true
+  SCALE_FACTOR: 16
+
+TEST:
+  IMAGE_SIZE:
+  - 512
+  - 512
+  BASE_SIZE: 640
+  BATCH_SIZE_PER_GPU: 16
+  FLIP_TEST: false
+  MULTI_SCALE: false

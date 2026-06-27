@@ -1,0 +1,524 @@
+HDP-PIDNet-DGA 第一阶段结构改造记录
+日期：2026-06-18
+
+一、阶段目标
+
+本阶段目标是在不破坏原始 PIDNet-S baseline 的前提下，构建一个独立的 HDP-PIDNet-DGA 版本。
+
+核心改造点是：将 PIDNet-S 中 I branch 原有的 PAPPM 上下文聚合模块，替换为 DGA-PAPPM。
+
+DGA-PAPPM 全称：
+Directional Gated Aggregation Parallel Pyramid Pooling Module
+
+中文含义：
+方向感知门控聚合并行金字塔池化模块。
+
+设计意图：
+
+1. 保留 PAPPM 的并行多尺度池化思想；
+2. 保留 local / scale0 基准路径；
+3. 保留 shortcut 稳定投影路径；
+4. 增加方向卷积分支，增强输电线这类细长目标的连续性；
+5. 增加门控聚合机制，让模型自适应融合局部、多尺度、方向和全局上下文；
+6. 保持 PIDNet-S 的 P branch、D branch、PagFM、Light_Bag、final_layer、输出格式和 loss 接口不变；
+7. 尽量兼容 Cityscapes PIDNet-S 预训练权重；
+8. 尽量保持轻量化和实时性。
+
+
+二、版本隔离原则
+
+本阶段遵循版本隔离原则：不修改原始 baseline 文件，通过复制和新增文件完成 HDP-DGA 版本。
+
+本阶段未主动修改以下 baseline 文件：
+
+1. models/pidnet.py
+2. models/model_utils.py
+3. models/__init__.py
+4. tools/train.py
+5. configs/default.py
+6. configs/power/pidnet_small_local_5_v1.yaml
+7. utils/utils.py
+
+说明：
+如果 git status 中这些 baseline 文件显示已有改动，那是本阶段开始前工作区已有状态，不属于本阶段 HDP-DGA 改造产生的改动。
+
+
+三、本阶段新增文件
+
+1. models/hdp_modules.py
+
+作用：
+新增 HDP 专用轻量模块文件，定义 DGA-PAPPM 及其基础卷积组件。
+
+主要内容：
+
+- ConvBNAct
+  基础卷积块，结构为 Conv2d + BatchNorm2d + ReLU，可通过 act=False 关闭激活。
+
+- DWConvBNAct
+  depthwise 卷积块，用于方向卷积分支，减少参数量和 FLOPs。
+
+- DGA_PAPPM
+  本阶段核心模块，用于替代 PIDNet-S I branch 中的 PAPPM。
+
+DGA_PAPPM 的输入输出接口：
+
+- 输入：[B, inplanes, H, W]
+- 输出：[B, outplanes, H, W]
+- 对 PIDNet-S：
+  输入：[B, 512, H, W]
+  输出：[B, 128, H, W]
+
+DGA_PAPPM 的结构：
+
+- local / scale0 branch：
+  使用 1x1 Conv + BN + ReLU，将输入从 inplanes 映射到 branch_planes。
+
+- multi-scale pooling branches：
+  继承 PAPPM 的并行金字塔池化思想，包含：
+  AvgPool kernel=5 stride=2
+  AvgPool kernel=9 stride=4
+  AvgPool kernel=17 stride=8
+  AdaptiveAvgPool2d(1)
+  各分支池化后用轻量 1x1 Conv 映射到 branch_planes，并上采样回原空间尺寸。
+
+- directional branch：
+  使用 1x7 depthwise conv + 7x1 depthwise conv，增强方向连续结构表达，主要面向输电线这类细长目标。
+
+- gated aggregation：
+  使用 AdaptiveAvgPool2d(1) 提取全局统计，再用 1x1 Conv 生成分支权重，通过 softmax 对 local、多尺度、global、directional 分支进行加权融合。
+
+- fusion and shortcut：
+  融合后通过轻量 1x1 Conv 输出到 outplanes，并与 shortcut 投影相加。
+
+
+2. models/pidnet_hdp.py
+
+作用：
+从 models/pidnet.py 复制生成，作为 HDP-PIDNet-DGA 的独立模型定义文件。
+
+主要改动：
+
+- 导入 DGA_PAPPM：
+  from .hdp_modules import DGA_PAPPM
+
+- PIDNet 初始化参数新增：
+  use_dga_pappm=False
+  dga_dir_kernel=7
+  dga_use_gate=True
+
+- 在 PIDNet-S 分支中，将原 PAPPM 初始化改为可选逻辑：
+  当 use_dga_pappm=False 时，仍使用 PAPPM；
+  当 use_dga_pappm=True 时，使用 DGA_PAPPM；
+  变量名保持为 self.spp。
+
+关键替换位置：
+
+原逻辑：
+  self.spp = PAPPM(planes * 16, ppm_planes, planes * 4)
+
+HDP 逻辑：
+  if use_dga_pappm:
+      self.spp = DGA_PAPPM(
+          planes * 16,
+          ppm_planes,
+          planes * 4,
+          dir_kernel=dga_dir_kernel,
+          use_gate=dga_use_gate
+      )
+  else:
+      self.spp = PAPPM(planes * 16, ppm_planes, planes * 4)
+
+forward 保持原逻辑：
+  x = F.interpolate(
+      self.spp(self.layer5(x)),
+      size=[height_output, width_output],
+      mode='bilinear',
+      align_corners=algc
+  )
+
+这意味着 DGA-PAPPM 是替代 I branch 的上下文聚合模块，而不是在 PIDNet 后面追加模块。
+
+预训练加载逻辑：
+
+新增更细致的 shape-matching 加载统计：
+
+- Loaded parameter tensors
+  成功加载到当前模型的参数 tensor 数。
+
+- Checkpoint keys not used
+  checkpoint 中存在，但当前模型中不存在的 key。
+
+- Shape mismatched tensors
+  checkpoint 和当前模型同名，但 shape 不一致的参数。
+
+- Model tensors not loaded
+  当前模型中最终没有从 checkpoint 加载的参数。
+
+- Expected random initialized tensors
+  预期随机初始化的参数，主要包括：
+  spp.*
+  seghead_p.conv2.*
+  final_layer.conv2.*
+
+这样可以明确判断 Cityscapes 预训练权重中哪些参数被复用，哪些因为 DGA-PAPPM 或 5 类分类头而随机初始化。
+
+
+3. configs/default_hdp.py
+
+作用：
+从 configs/default.py 复制生成，作为 HDP 专用配置系统。
+
+新增配置字段：
+
+  _C.MODEL.USE_DGA_PAPPM = False
+  _C.MODEL.DGA_DIR_KERNEL = 7
+  _C.MODEL.DGA_USE_GATE = True
+
+目的：
+
+YACS 默认不允许 YAML 合并未知字段。如果直接把 DGA-PAPPM 的字段写入新 YAML，而不扩展配置系统，会报未知字段错误。
+
+因此本阶段不修改原 configs/default.py，而是新增 configs/default_hdp.py，使 HDP 训练入口使用独立配置系统。
+
+
+4. configs/power/pidnet_small_local_5_dga_pappm_v1.yaml
+
+作用：
+从 baseline 配置 configs/power/pidnet_small_local_5_v1.yaml 复制生成，作为 HDP-DGA 实验配置。
+
+新增字段：
+
+MODEL:
+  USE_DGA_PAPPM: true
+  DGA_DIR_KERNEL: 7
+  DGA_USE_GATE: true
+
+保持不变的内容：
+
+- MODEL.NAME: pidnet_s
+- DATASET.NUM_CLASSES: 5
+- DATASET.ROOT
+- TRAIN.LR
+- TRAIN.BATCH_SIZE_PER_GPU
+- TRAIN.END_EPOCH
+- TRAIN.IMAGE_SIZE
+- TRAIN.BASE_SIZE
+- LOSS.USE_OHEM
+- LOSS.OHEMTHRES
+- LOSS.OHEMKEEP
+- LOSS.BALANCE_WEIGHTS
+- LOSS.SB_WEIGHTS
+
+保持 MODEL.NAME 为 pidnet_s 的原因：
+get_seg_model 中通过 's' in cfg.MODEL.NAME 判断 PIDNet-S 尺寸。保持 pidnet_s 可以避免破坏模型尺寸选择逻辑。
+
+
+5. tools/train_hdp.py
+
+作用：
+从 tools/train.py 复制生成，作为 HDP-PIDNet-DGA 专用训练入口。
+
+主要改动：
+
+- 使用 configs/default_hdp.py，而不是 baseline 的 configs/default.py。
+- 显式导入 HDP 模型：
+  import models.pidnet_hdp as pidnet_hdp
+
+- 构建模型时调用：
+  model = pidnet_hdp.get_seg_model(config, imgnet_pretrained=imgnet)
+
+- 使用 HDP 专用 FullModelHDP：
+  from utils.utils_hdp import FullModelHDP
+  model = FullModelHDP(model, sem_criterion, bd_criterion, config)
+
+为什么需要 FullModelHDP：
+
+原 utils/utils.py 中的 FullModel 内部引用：
+  from configs import config
+
+这会拿到 baseline 的默认配置，而不是 HDP 的 default_hdp 配置。
+
+在 smoke test 中曾出现 CUDA index out of bounds，原因是：
+
+- HDP 配置中 TRAIN.IGNORE_LABEL = 255
+- 原 FullModel 可能使用 baseline 默认 IGNORE_LABEL = -1
+- bd_label 被填为 -1
+- OhemCrossEntropy 使用 ignore_label=255
+- -1 没有被忽略，进入 gather，引发 CUDA index out of bounds
+
+因此新增 HDP 专用 FullModelHDP，让它显式接收当前 config，并使用：
+  self.config.TRAIN.IGNORE_LABEL
+  self.config.MODEL.ALIGN_CORNERS
+  self.config.DATASET.NUM_CLASSES
+
+
+6. utils/utils_hdp.py
+
+作用：
+新增 HDP 专用训练工具文件，当前主要包含 FullModelHDP。
+
+FullModelHDP 的作用：
+
+- 包装模型、语义分割 loss、边界 loss；
+- 保持原 PIDNet 训练输出格式；
+- 使用 HDP 当前配置，而不是 baseline 全局配置；
+- 修复 ignore label 不一致导致的 CUDA index out of bounds；
+- 加入标签合法性检查，提前发现非法 label。
+
+关键逻辑：
+
+  filler = torch.ones_like(labels) * self.config.TRAIN.IGNORE_LABEL
+  bd_label = torch.where(torch.sigmoid(outputs[-1][:, 0, :, :]) > 0.8, labels, filler)
+
+标签合法性检查：
+
+- labels 必须属于：
+  [0, DATASET.NUM_CLASSES - 1] 或 IGNORE_LABEL
+
+- bd_label 必须属于：
+  [0, DATASET.NUM_CLASSES - 1] 或 IGNORE_LABEL
+
+如果发现非法值，会在 Python 端抛出 ValueError，避免 CUDA device-side assert 难以定位。
+
+
+7. tools/test_hdp_forward.py
+
+作用：
+HDP-DGA 最小 forward 测试脚本。
+
+特点：
+
+- 不训练；
+- 不加载预训练权重；
+- 直接实例化 pidnet_hdp.PIDNet；
+- 使用 model.eval()；
+- 输入 torch.randn(1, 3, 512, 512)；
+- 检查输出格式和通道数。
+
+检查内容：
+
+- 输出必须是 list；
+- list 长度必须为 3；
+- 主输出为 y[1]；
+- 主输出通道数必须等于 DATASET.NUM_CLASSES，即 5；
+- 边界输出 y[2] 通道数必须为 1。
+
+验证结果：
+
+  python tools/test_hdp_forward.py
+
+输出：
+
+  forward ok
+  main: (1, 5, 64, 64)
+
+说明：
+
+输入 512x512 时，PIDNet 训练输出为 1/8 尺度，因此 64x64 是合理的。
+
+
+8. tools/compare_hdp_complexity.py
+
+作用：
+对比 baseline PIDNet-S 和 HDP-PIDNet-DGA 的参数量。
+
+特点：
+
+- 不加载预训练权重；
+- 不训练；
+- 直接实例化模型结构；
+- 统计总参数和可训练参数。
+
+验证结果：
+
+  python tools/compare_hdp_complexity.py
+
+输出：
+
+  PIDNet-S baseline Params: 7717323
+  HDP-PIDNet-DGA Params: 7397649
+  Delta Params: -319674
+  PIDNet-S baseline Trainable Params: 7717323
+  HDP-PIDNet-DGA Trainable Params: 7397649
+  FLOPs: TODO
+  FPS: TODO
+
+结论：
+
+HDP-PIDNet-DGA 比 baseline PIDNet-S 少 319674 个参数。
+
+这是合理的：
+原 PAPPM 中 scale_process 包含较重的 grouped 3x3 卷积；
+DGA-PAPPM 虽然增加了方向分支和门控分支，但主要使用 1x1 卷积和 depthwise 方向卷积，因此整体参数量更少。
+
+
+四、训练验证记录
+
+成功运行 2 epoch smoke test：
+
+  python tools/train_hdp.py --cfg configs/power/pidnet_small_local_5_dga_pappm_v1.yaml TRAIN.END_EPOCH 2
+
+成功日志：
+
+  output/custom/pidnet_small_local_5_dga_pappm_v1/
+  pidnet_small_local_5_dga_pappm_v1_2026-06-18-21-29_train.log
+
+生成文件：
+
+  checkpoint.pth.tar
+  best.pt
+  final_state.pt
+
+训练配置关键值：
+
+  DATASET.NUM_CLASSES: 5
+  MODEL.USE_DGA_PAPPM: True
+  MODEL.DGA_DIR_KERNEL: 7
+  MODEL.DGA_USE_GATE: True
+  TRAIN.IGNORE_LABEL: 255
+  TRAIN.END_EPOCH: 2
+
+预训练权重加载统计：
+
+  Loaded parameter tensors: 427
+  Checkpoint keys not used: 50
+  Shape mismatched tensors: 4
+  Model tensors not loaded: 67
+  Expected random initialized tensors: 67
+
+这些统计符合预期：
+
+- spp.* 未加载：因为 PAPPM 被 DGA-PAPPM 替换；
+- seghead_p.conv2.* 和 final_layer.conv2.* shape mismatch：因为 Cityscapes 是 19 类，当前任务是 5 类；
+- sem_loss.criterion.weight 和 sb_loss.criterion.weight 未使用：这是 checkpoint 中 FullModel/loss 相关权重，不属于当前裸模型结构。
+
+
+五、2 epoch 指标记录
+
+Epoch 0 验证结果：
+
+  Output[1] mIoU: 0.4195
+  background: 0.9578
+  powerline: 0.4430
+  tower_wooden: 0.0116
+  tower_lattice: 0.5920
+  tower_tucohy: 0.0931
+  Loss: 1.734
+  Best_mIoU: 0.4195
+
+Epoch 1 验证结果：
+
+  Output[1] mIoU: 0.4570
+  background: 0.9608
+  powerline: 0.4703
+  tower_wooden: 0.0555
+  tower_lattice: 0.5921
+  tower_tucohy: 0.2064
+  Loss: 1.606
+  Best_mIoU: 0.4570
+
+观察：
+
+- 训练能够完整跑通；
+- loss 从初期较高值逐步下降；
+- 主输出 mIoU 从 0.4195 提升到 0.4570；
+- powerline IoU 从 0.4430 提升到 0.4703；
+- tower_tucohy IoU 从 0.0931 提升到 0.2064；
+- smoke test 阶段结果只能证明训练链路可行，不能代表最终精度结论。
+
+
+六、当前代码是否可行
+
+当前 HDP-DGA 第一阶段代码可行。
+
+依据：
+
+1. forward 测试通过；
+2. 参数量统计正常；
+3. 2 epoch smoke test 完整通过；
+4. 预训练加载统计符合预期；
+5. 已修复 ignore label 不一致导致的 CUDA index out of bounds；
+6. baseline 文件未被本阶段主动修改；
+7. HDP-DGA 有独立模型、独立配置、独立训练入口、独立 FullModel 包装。
+
+
+七、当前方案的合理性
+
+合理点：
+
+1. 结构位置合理
+   DGA-PAPPM 替换的是 I branch 原 PAPPM，上下文建模位置正确，不是简单在模型末尾追加模块。
+
+2. 接口保持一致
+   DGA-PAPPM 输入输出 shape 与 PAPPM 一致，因此 forward、Light_Bag、final_layer 均无需修改。
+
+3. 预训练兼容性较好
+   除 spp.* 和 5 类分类头外，主干、P branch、D branch、PagFM、Light_Bag 等参数继续通过 shape-matching 加载。
+
+4. 参数量更轻
+   HDP-PIDNet-DGA 参数量为 7397649，比 baseline 7717323 少 319674。
+
+5. 任务适配性较强
+   多尺度分支有利于杆塔完整性；
+   方向分支有利于输电线连续性；
+   门控聚合有利于在局部、多尺度、方向和全局上下文之间自适应选择。
+
+
+八、当前方案的注意点
+
+1. DGA-PAPPM 参数更少，不等于最终精度一定更高。
+   需要完整训练后与 baseline 对比。
+
+2. 原 PAPPM 的 scale_process 具有跨尺度卷积混合能力。
+   当前 DGA-PAPPM 改为门控加权融合，更轻量，但表达方式不同。最终效果需要实验验证。
+
+3. FLOPs 和 FPS 当前尚未统计。
+   tools/compare_hdp_complexity.py 中 FLOPs 和 FPS 仍为 TODO。
+
+4. 2 epoch smoke test 只说明训练链路正确。
+   最终结论应基于完整训练、验证集 mIoU、各类别 IoU、边界指标和推理速度。
+
+
+九、后续建议
+
+1. 跑完整 HDP-DGA 训练：
+
+   python tools/train_hdp.py --cfg configs/power/pidnet_small_local_5_dga_pappm_v1.yaml
+
+2. 跑同配置 baseline 作为对照：
+
+   python tools/train.py --cfg configs/power/pidnet_small_local_5_v1.yaml
+
+3. 对比指标：
+
+   mIoU
+   powerline IoU
+   tower_wooden IoU
+   tower_lattice IoU
+   tower_tucohy IoU
+   boundary IoU
+   relaxed IoU
+   FPS / latency
+
+4. 如果后续继续加入 BAFM-P、LCEG、MCC、Sobel，应继续遵守版本隔离原则：
+
+   模型结构扩展：优先放在 models/hdp_modules.py 和 models/pidnet_hdp.py
+   loss 扩展：新增 HDP 专用 loss 文件，不直接改 utils/criterion.py
+   训练入口扩展：继续使用 tools/train_hdp.py 或复制新入口
+   配置扩展：只改 configs/default_hdp.py 和 HDP 专用 yaml
+
+
+十、本阶段结论
+
+HDP-PIDNet-DGA 第一阶段结构改造已经完成，当前代码具备以下特征：
+
+- 独立于 baseline；
+- 可 forward；
+- 可训练；
+- 可加载 Cityscapes PIDNet-S 预训练权重中的大部分可兼容参数；
+- DGA-PAPPM 成功替代 PIDNet-S I branch 的 PAPPM；
+- 参数量比 baseline 更少；
+- 2 epoch smoke test 通过。
+
+因此，可以进入完整训练和正式消融对比阶段。

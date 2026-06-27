@@ -1,0 +1,500 @@
+你现在在现有 PIDNet-S 五分类语义分割代码库中，实现一个版本：PIDNet-S + LSE-v1。
+
+我的使用方式：
+
+我训练前会手动把版本文件覆盖到正式文件。例如：
+
+```text
+models/pidnet_lse_v1.py  →  models/pidnet.py
+models/model_utils_lse_v1.py  →  models/model_utils.py
+```
+
+或者如果项目中实际叫 `modules_utils.py`，则对应替换：
+
+```text
+models/modules_utils_lse_v1.py  →  models/modules_utils.py
+```
+
+所以你生成的带后缀文件，必须是“替换为正式文件后可以直接训练”的版本。
+
+本次不要新增训练脚本，不要新增数据处理脚本，不要新增 loss 文件，不要实现 HMT、line head、tower head、多任务输出。最终模型仍然只输出原来的 5 类语义分割结果：
+
+```text
+0 background
+1 powerline
+2 wooden tower
+3 lattice tower
+4 other / tucohy tower
+255 ignore
+```
+
+---
+
+## 一、需要先判断是否只需要改 3 类文件
+
+请先检查当前代码结构，判断实现 LSE-v1 是否只需要控制以下文件：
+
+```text
+1. models/pidnet.py 的版本文件
+2. models/model_utils.py 或 modules_utils.py 的版本文件
+3. 对应 yaml 配置文件
+```
+
+我的预期是：
+
+```text
+models/pidnet_lse_v1.py
+models/model_utils_lse_v1.py 或 models/modules_utils_lse_v1.py
+configs/power/pidnet_small_local_5_lse_v1.yaml
+```
+
+原则上不应该需要修改：
+
+```text
+train.py
+dataset 文件
+loss 文件
+evaluator 文件
+data_process.py
+utils 文件
+```
+
+但是你必须实际检查代码逻辑。如果发现还必须修改其他文件，请明确说明原因，例如：
+
+```text
+如果模型构建不是直接 import models/pidnet.py，而是通过 models/__init__.py 或 factory 注册模型名，则可能需要改注册文件。
+如果 yaml 中 MODEL.NAME 会决定模型构建函数，则可能需要同步改注册逻辑。
+如果训练脚本 hard-code 了某个模型名或输出目录字段，则可能需要改 yaml 或训练参数。
+```
+
+如果不需要，请明确回答：
+
+```text
+除 pidnet 版本文件、model_utils/modules_utils 版本文件和 yaml 之外，不需要修改其他文件。
+```
+
+---
+
+## 二、LSE-v1 模块设计
+
+模块名称：
+
+```python
+LineStructureEnhancement
+```
+
+简称：
+
+```text
+LSE
+```
+
+设计目的：
+
+增强 PIDNet-S 中 P branch 的高分辨率细节特征，使模型更容易学习输电线、细杆、横担等细长结构，目标是减少输电线断裂和漏检，同时尽量避免线变粗和大面积假阳性。
+
+LSE-v1 只做轻量结构增强，不改输出、不加新任务、不加新 loss。
+
+---
+
+## 三、LSE-v1 结构
+
+输入输出 shape 必须一致：
+
+```python
+input:  [B, C, H, W]
+output: [B, C, H, W]
+```
+
+结构采用三个 depthwise 分支：
+
+### 1. 水平方向分支
+
+用于增强横向或近似横向的线结构：
+
+```python
+Conv2d(C, C, kernel_size=(1, k), padding=(0, k//2), groups=C, bias=False)
+BatchNorm2d(C)
+ReLU(inplace=True)
+```
+
+### 2. 垂直方向分支
+
+用于增强竖向或近似竖向的杆件结构：
+
+```python
+Conv2d(C, C, kernel_size=(k, 1), padding=(k//2, 0), groups=C, bias=False)
+BatchNorm2d(C)
+ReLU(inplace=True)
+```
+
+### 3. 局部空洞分支
+
+用于补充局部上下文和斜向结构响应：
+
+```python
+Conv2d(C, C, kernel_size=3, padding=dilation, dilation=dilation, groups=C, bias=False)
+BatchNorm2d(C)
+ReLU(inplace=True)
+```
+
+### 4. 融合
+
+```python
+cat = torch.cat([h, v, d], dim=1)
+fused = Conv2d(3*C, C, kernel_size=1, bias=False)(cat)
+fused = BatchNorm2d(C)(fused)
+```
+
+### 5. 残差输出
+
+```python
+out = x + alpha * fused
+out = ReLU(inplace=True)(out)
+```
+
+推荐默认参数：
+
+```python
+kernel_size = 9
+dilation = 2
+alpha = nn.Parameter(torch.zeros(1))
+```
+
+注意：`alpha` 初始化为 0，使模型初始状态接近 baseline，避免刚开始训练时大幅扰动 PIDNet-S 原有特征。
+
+如果 fusion 的最后 BatchNorm 有 affine 参数，建议将其初始化为 0：
+
+```python
+nn.init.zeros_(self.fuse_bn.weight)
+nn.init.zeros_(self.fuse_bn.bias)
+```
+
+如果项目中的 BN 写法不同，请按实际代码风格处理。核心原则是：LSE 初始行为应接近 identity residual。
+
+---
+
+## 四、LSE 插入位置
+
+请在 `pidnet_lse_v1.py` 中找到 PIDNet-S 的 P branch 高分辨率细节分支。
+
+通常 forward 中会有类似：
+
+```python
+x_ = self.layer3_(...)
+x_ = self.layer4_(...)
+x_ = self.layer5_(self.relu(x_))
+```
+
+请在 `layer5_` 之后、Light-Bag / DFM 融合之前插入：
+
+```python
+x_ = self.layer5_(self.relu(x_))
+x_ = self.lse(x_)
+```
+
+要求：
+
+```text
+1. LSE 只作用于 P branch 的 x_。
+2. 不作用于 I branch 的 x。
+3. 不作用于 D branch 的 x_d。
+4. 不替换 PAPPM。
+5. 不替换 Light-Bag。
+6. 不替换 PagFM。
+7. 不改 final_layer。
+8. 不改输出类别数。
+9. 不改 forward 返回格式。
+```
+
+---
+
+## 五、LSE 输入通道必须从代码中确认
+
+不要盲目写死通道数。
+
+请检查原始 PIDNet-S 中 `layer5_` 的输出通道。
+
+如果原始代码中 `layer5_` 输出是：
+
+```python
+planes * 4
+```
+
+则在 `__init__` 中写：
+
+```python
+self.lse = LineStructureEnhancement(planes * 4, kernel_size=9, dilation=2)
+```
+
+如果实际不是 `planes * 4`，请根据真实代码填写。
+
+最终请明确说明：
+
+```text
+LSE input channels = ?
+依据：layer5_ 输出通道
+```
+
+---
+
+## 六、文件修改方式
+
+请生成以下版本文件。
+
+### 1. `models/pidnet_lse_v1.py`
+
+复制当前 `models/pidnet.py`，在其中加入 LSE 调用。
+
+要求：
+
+```text
+1. 类名和模型构建函数接口尽量保持和原 pidnet.py 一致。
+2. get_seg_model(...) 接口保持一致。
+3. get_pred_model(...) 如果存在，也保持一致。
+4. forward 返回格式保持一致。
+5. 训练脚本后续无需因为这个版本做额外修改。
+```
+
+也就是说，我后续把它覆盖为 `models/pidnet.py` 后，原训练流程应该能直接跑。
+
+### 2. `models/model_utils_lse_v1.py` 或 `models/modules_utils_lse_v1.py`
+
+请根据当前项目真实文件名处理。
+
+如果原 `pidnet.py` 导入的是：
+
+```python
+from .model_utils import ...
+```
+
+就复制为：
+
+```text
+models/model_utils_lse_v1.py
+```
+
+并在里面新增 `LineStructureEnhancement`。
+
+如果原 `pidnet.py` 导入的是：
+
+```python
+from .modules_utils import ...
+```
+
+就复制为：
+
+```text
+models/modules_utils_lse_v1.py
+```
+
+并在里面新增 `LineStructureEnhancement`。
+
+如果你认为为了后续覆盖方便，直接把 `LineStructureEnhancement` 写在 `pidnet_lse_v1.py` 里更稳，也可以这样做。
+但请说明选择原因。
+
+### 3. yaml
+
+复制当前 baseline yaml 为：
+
+```text
+configs/power/pidnet_small_local_5_lse_v1.yaml
+```
+
+只改实验名、输出目录、日志目录、checkpoint 名称等，避免覆盖 baseline。
+
+保持核心训练参数不变：
+
+```yaml
+NUM_CLASSES: 5
+IGNORE_LABEL: 255
+USE_OHEM: true
+OHEMTHRES: 0.9
+OHEMKEEP: 200000
+CLASS_BALANCE: False
+MODEL.NUM_OUTPUTS: 2
+LOSS.BALANCE_WEIGHTS: [0.4, 1.0]
+LR: 0.001
+BATCH_SIZE_PER_GPU: 8
+```
+
+不要改 dataset 路径、split、label、data augmentation，除非原 yaml 中实验输出路径必须改。
+
+---
+
+## 七、forward 输出必须保持原样
+
+这是最重要的兼容性检查。
+
+如果 baseline 训练时返回：
+
+```python
+[x_extra, x_main, x_boundary]
+```
+
+LSE 版本也必须返回：
+
+```python
+[x_extra, x_main, x_boundary]
+```
+
+如果 baseline eval 时返回：
+
+```python
+x_main
+```
+
+LSE 版本也必须返回：
+
+```python
+x_main
+```
+
+不要返回 dict。
+
+不要新增 line 输出。
+
+不要新增 tower 输出。
+
+不要改变 list 顺序。
+
+不要改变 loss 读取方式。
+
+---
+
+## 八、预训练加载兼容性
+
+LSE 新增参数没有预训练权重是正常的。
+
+请确保：
+
+```text
+1. 原 backbone 参数尽量正常加载。
+2. 原 P/I/D branch 参数尽量正常加载。
+3. 原 PAPPM 参数正常加载。
+4. 原 Light-Bag / DFM 参数正常加载。
+5. 原 final classifier 如果因为 19 类到 5 类 shape mismatch 被跳过，保持原逻辑。
+6. 新增 LSE 参数随机初始化。
+```
+
+不要为了 LSE 大改预训练加载逻辑。
+
+---
+
+## 九、必须检查的代码逻辑
+
+完成后请重点检查：
+
+```text
+1. LSE 是否真的被调用。
+2. LSE 是否只插入在 P branch。
+3. LSE 输入输出 shape 是否一致。
+4. LSE 输入通道是否正确。
+5. I branch 是否未改。
+6. D branch 是否未改。
+7. PAPPM 是否未改。
+8. Light-Bag 是否未改。
+9. final_layer 是否未改。
+10. forward 返回数量、顺序、类型是否和 baseline 一致。
+11. eval 输出类别数是否仍然是 5。
+12. 是否没有新增 line head / tower head。
+13. 是否没有新增 loss。
+14. 是否没有修改 train.py。
+15. 是否没有修改 dataset / data_process.py。
+16. 除 pidnet、model_utils/modules_utils、yaml 外，是否还有必须修改的文件。如果有，说明为什么。
+```
+
+---
+
+## 十、建议提供一个简单检查方法
+
+不强制新增脚本，但请至少给出一段检查代码，用于确认：
+
+```text
+1. 模型能 import。
+2. dummy forward 能跑。
+3. train mode 输出格式和 baseline 一致。
+4. eval mode 输出格式和 baseline 一致。
+5. LSE 输入输出 shape 一致。
+```
+
+可以用 forward hook 检查 LSE：
+
+```python
+def hook_fn(module, inputs, outputs):
+    print("LSE input:", inputs[0].shape)
+    print("LSE output:", outputs.shape)
+```
+
+dummy input：
+
+```python
+x = torch.randn(2, 3, 512, 512)
+```
+
+---
+
+## 十一、参数量检查
+
+请给出参数量对比方法。
+
+理论上，如果 `C=128, k=9`，LSE 主要参数量约为 5 万级别：
+
+```text
+horizontal depthwise: C * 9
+vertical depthwise: C * 9
+dilated depthwise: C * 3 * 3
+1x1 fusion: 3C * C
+```
+
+如果参数量增加异常大，说明实现可能有问题。
+
+---
+
+## 十二、本次不要做的内容
+
+本次不要实现：
+
+```text
+HMT
+line head
+tower head
+多任务输出
+FAM-lite
+HAM-lite
+CA-lite
+ODConv
+FADC
+Dice loss
+MCC loss
+rare tower loss
+推理后处理
+新 train 脚本
+新 dataset
+新 evaluator
+```
+
+本次唯一目标：
+
+```text
+在 PIDNet-S 中加入 LSE-v1，使其作为 pidnet.py 的替换版本后可以直接训练，并保持最终仍然是 5 类语义分割输出。
+```
+
+---
+
+## 十三、最终交付
+
+请最终给出：
+
+```text
+1. 新增/修改文件列表。
+2. LSE 模块完整代码。
+3. LSE 在 pidnet_lse_v1.py 中的插入位置。
+4. LSE 输入通道数和依据。
+5. yaml 复制和修改说明。
+6. forward 输出格式与 baseline 一致性说明。
+7. dummy forward 检查代码或检查结果。
+8. 参数量对比代码或结果。
+9. 是否除 pidnet、model_utils/modules_utils、yaml 外还需要修改其他文件。
+10. 如果有不确定点，请明确指出，不要猜测。
+```

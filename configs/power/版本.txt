@@ -1,0 +1,4 @@
+v1是普通的基线不加cw
+cw是加入高强度class weights
+cw2是调整了，cw3是增加了id2、4的数据
+v2是加入spm，v2_2是调整了spm的加入位置

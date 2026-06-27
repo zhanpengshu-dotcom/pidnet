@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git checkout *)",
+      "Read(//c/Users/Administrator/Desktop/Dataset/data2500/**)",
+      "Read(//c/Users/Administrator/Desktop/Dataset/data1242/**)",
+      "Bash(python data_process.py)",
+      "Bash(conda env *)",
+      "Bash(where python *)",
+      "Bash(python -c \"import torch; print\\('torch OK:', torch.__version__\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('c:/Users/Administrator/Desktop/PIDNet-main/models/model_utils.py'\\).read\\(\\)\\); print\\('model_utils.py: 语法OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('c:/Users/Administrator/Desktop/PIDNet-main/models/pidnet.py'\\).read\\(\\)\\); print\\('pidnet.py: 语法OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('c:/Users/Administrator/Desktop/PIDNet-main/verify_odconv.py'\\).read\\(\\)\\); print\\('verify_odconv.py: 语法OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('c:/Users/Administrator/Desktop/PIDNet-main/models/model_utils.py', encoding='utf-8'\\).read\\(\\)\\); print\\('model_utils.py: syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('c:/Users/Administrator/Desktop/PIDNet-main/verify_odconv.py', encoding='utf-8'\\).read\\(\\)\\); print\\('verify_odconv.py: syntax OK'\\)\")",
+      "Bash(curl -sk https://api.github.com/repos/zsyggg/paper-craft-skills/contents/skills/paper-deck)",
+      "Bash(mkdir -p ~/.claude/skills/paper-comic/references/styles ~/.claude/skills/paper-analyzer/styles ~/.claude/skills/paper-analyzer/scripts ~/.claude/skills/paper-deck/references ~/.claude/skills/paper-deck/scripts 2>&1)",
+      "Bash(curl -sk https://raw.githubusercontent.com/zsyggg/paper-craft-skills/main/skills/paper-comic/references/base-prompt.md -o ~/.claude/skills/paper-comic/references/base-prompt.md)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\Administrator\\.claude\\skills\\paper-comic\\references"
+    ]
+  }
+}

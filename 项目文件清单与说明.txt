@@ -1,0 +1,518 @@
+================================================================================
+          PIDNet-main 项目文件清单与功能说明
+================================================================================
+
+项目概述:
+  本项目是 PIDNet（比例-积分-微分网络）实时语义分割框架的修改版本，
+  原始项目由 Jiacong Xu 开发（CVPR 2023）。
+  本项目已针对电力线路和输电塔分割任务进行了定制化改造，
+  新增了条带池化模块（SPM）和全维动态卷积（ODConv）等自定义模块。
+
+================================================================================
+一、根目录文件
+================================================================================
+
+1. README.md
+   作用：官方 PIDNet 项目文档，包含模型下载链接、训练/评估指令、架构概述
+   角色：项目使用说明和文档入口
+
+2. LICENSE
+   作用：MIT 开源许可证，版权归属 Jiacong Xu (2022)
+   角色：法律授权文件
+
+3. MODIFICATION_LOG.txt
+   作用：详细记录了三次改造过程：(1) SPM 集成 (2) ODConv vs DCNv2 分析 (3) ODConv 代码实现
+   角色：电力线路项目的改造审计日志
+
+4. data_process.py
+   作用：数据集预处理脚本，通过滑动窗口将 4K 图像裁剪为 512x512 的小块，
+        对掩码进行分类（空白/线路/塔/两者），划分训练/验证/测试集，写入列表文件
+   角色：自定义电力线路数据集的准备工具
+
+5. verify_spm.py
+   作用：6层验证脚本，证明条带池化模块（SPM）在 PIDNet 中功能正常
+        （形状、激活、方向敏感性、区分能力、集成效果、输出差异）
+   角色：SPM 正确性验证工具
+
+6. verify_odconv.py
+   作用：6层验证脚本，验证 ODConv 集成的正确性
+        （形状、注意力活动、输入敏感性、残差保持、PIDNet集成、输出差异）
+   角色：ODConv 正确性验证工具
+
+7. quanchicuntuili.py
+   作用：全图推理脚本，在原始大图上使用滑动窗口进行推理；
+        生成原始掩码和彩色叠加可视化结果，用于 3DGS 和论文插图
+   角色：全分辨率图像的批量推理工具
+
+8. pinghua_val.py
+   作用：训练日志解析器，使用指数移动平均（EMA）平滑技术，
+        可视化损失、准确率、mIoU 和各类别 IoU 曲线
+   角色：平滑后的训练指标可视化工具
+
+9. tongyong_val.py
+   作用：通用训练日志解析器（无平滑），绘制原始损失、准确率、mIoU 和各类别 IoU，
+        标注最佳点
+   角色：原始训练指标可视化工具
+
+================================================================================
+二、configs/ -- 配置文件目录
+================================================================================
+
+configs/__init__.py
+  作用：导入默认配置和 update_config 函数
+  角色：配置包初始化文件
+
+configs/default.py
+  作用：基于 YACS 的默认配置文件，定义所有超参数
+      （模型、数据集、损失、训练、测试设置）
+  角色：基础配置模板
+
+---------- configs/camvid/ -- CamVid 数据集配置 ----------
+
+configs/camvid/pidnet_small_camvid.yaml
+  作用：PIDNet-S 在 CamVid 上的配置（11类，960x720，使用 Cityscapes 预训练权重）
+  角色：CamVid 小模型训练配置
+
+configs/camvid/pidnet_medium_camvid.yaml
+  作用：PIDNet-M 在 CamVid 上的配置（11类，960x720，使用 Cityscapes 预训练权重）
+  角色：CamVid 中等模型训练配置
+
+---------- configs/cityscapes/ -- Cityscapes 数据集配置 ----------
+
+configs/cityscapes/pidnet_small_cityscapes.yaml
+  作用：PIDNet-S 在 Cityscapes 训练集上的配置（19类，1024x1024，ImageNet 预训练，484轮）
+  角色：Cityscapes 小模型训练配置
+
+configs/cityscapes/pidnet_medium_cityscapes.yaml
+  作用：PIDNet-M 在 Cityscapes 训练集上的配置
+  角色：Cityscapes 中等模型训练配置
+
+configs/cityscapes/pidnet_large_cityscapes.yaml
+  作用：PIDNet-L 在 Cityscapes 训练集上的配置
+  角色：Cityscapes 大模型训练配置
+
+configs/cityscapes/pidnet_small_cityscapes_trainval.yaml
+  作用：PIDNet-S 在 Cityscapes 训练+验证集上的配置
+  角色：Cityscapes 小模型（trainval）训练配置
+
+configs/cityscapes/pidnet_medium_cityscapes_trainval.yaml
+  作用：PIDNet-M 在 Cityscapes 训练+验证集上的配置
+  角色：Cityscapes 中等模型（trainval）训练配置
+
+configs/cityscapes/pidnet_large_cityscapes_trainval.yaml
+  作用：PIDNet-L 在 Cityscapes 训练+验证集上的配置
+  角色：Cityscapes 大模型（trainval）训练配置
+
+---------- configs/power/ -- 自定义电力线路数据集配置 ----------
+
+configs/power/pidnet_power.yaml
+  作用：首次 PIDNet-S 电力数据集配置（3类，512x512，Cityscapes预训练，80轮，学习率0.002）
+  角色：初始电力线路训练配置
+
+configs/power/pidnet_small_local.yaml
+  作用：PIDNet-S 本地训练配置（300轮，学习率0.001，多尺度开启）
+  角色：本地机器小模型训练配置
+
+configs/power/pidnet_small_local_v1.yaml
+  作用：PIDNet-S 本地配置 v1（与 local 基础版相同）
+  角色：本地训练变体 v1
+
+configs/power/pidnet_small_local_v2.yaml
+  作用：PIDNet-S 本地配置 v2（与 v1 相同）
+  角色：本地训练变体 v2
+
+configs/power/pidnet_small_local_v3.yaml
+  作用：PIDNet-S 本地配置 v3（与 v1 相同）
+  角色：本地训练变体 v3
+
+configs/power/pidnet_small_local_v4.yaml
+  作用：PIDNet-S 本地配置 v4（与 v1 相同）
+  角色：本地训练变体 v4
+
+configs/power/pidnet_small_a100.yaml
+  作用：PIDNet-S A100 服务器配置（batch 128，学习率0.01，多尺度开启，Cityscapes预训练）
+  角色：A100 服务器小模型训练配置
+
+configs/power/pidnet_large_a100.yaml
+  作用：PIDNet-L A100 配置（ImageNet预训练，batch 64，300轮，SB_WEIGHTS 0.5）
+  角色：A100 大模型训练配置 v1
+
+configs/power/pidnet_large_a100_v2.yaml
+  作用：PIDNet-L v2 A100 配置（Cityscapes预训练，SB_WEIGHTS 0.1，OHEMTHRES 0.9）
+  角色：A100 大模型训练配置 v2
+
+configs/power/pidnet_large_a100_v3.yaml
+  作用：PIDNet-L v3 A100 配置（与 v2 相同，配合 SPM+ODConv 模型使用）
+  角色：A100 大模型训练配置 v3
+
+================================================================================
+三、models/ -- 神经网络模型目录
+================================================================================
+
+models/__init__.py
+  作用：导入 models.pidnet 模块
+  角色：模型包初始化文件
+
+models/pidnet.py
+  作用：【当前使用的主模型】PIDNet v4 版本，集成了 SPM + ODConv（带坐标注意力的 CA_ODConv2d）；
+      包含 PIDNet 类、get_seg_model()、get_pred_model() 函数以及速度测试功能
+  角色：训练和推理的主要模型定义
+
+models/model_utils.py
+  作用：【当前使用的工具模块】包含所有构建模块：
+      BasicBlock, Bottleneck, segmenthead, DAPPM, PAPPM, PagFM, Light_Bag,
+      DDFMv2, Bag, StripPooling, CoordAtt, CA_ODConv2d, ODConvBasicBlock
+  角色：所有网络构建块的工具集
+
+models/pidnet_v2.py
+  作用：PIDNet v2 版本：基线 + 仅 SPM（无 ODConv）
+  角色：消融实验 B
+
+models/model_utils_v2.py
+  作用：模型工具 v2：标准模块 + StripPooling（无 ODConv）
+  角色：v2 版本的工具模块
+
+models/pidnet_v3.py
+  作用：PIDNet v3 版本：基线 + SPM + 原始 ODConv（无坐标注意力）
+  角色：消融实验 C
+
+models/model_utils_v3.py
+  作用：模型工具 v3：标准模块 + StripPooling + ODConv2d + ODConvBasicBlock
+  角色：v3 版本的工具模块
+
+models/pidnet_v4.py
+  作用：PIDNet v4 版本：基线模型（无 SPM，无 ODConv），用于消融实验 A
+  角色：消融实验 A（基线）
+
+models/model_utils_v4.py
+  作用：模型工具 v4：与原始 model_utils.py 相同（仅标准模块）
+  角色：v4 基线版本的工具模块
+
+---------- models/others/ -- 参考实现 ----------
+
+models/others/resnet.py
+  作用：ResNet-18 骨干网络实现
+  角色：用于 BiSeNet 对比实验的骨干网络
+
+models/others/bisenet_adb_bag.py
+  作用：BiSeNet + ADB+Bag 融合版本（修改自 CoinCheung/BiSeNet）
+  角色：对比基准模型
+
+models/others/ddrnet_23_adb_bag.py
+  作用：DDRNet-23 + ADB+Bag 融合版本（修改自 ydhongHIT/DDRNet）
+  角色：对比基准模型
+
+---------- models/speed/ -- 速度基准测试 ----------
+
+models/speed/pidnet_speed.py
+  作用：独立的 PIDNet 速度测量脚本，包含 FPS 基准测试
+  角色：推理速度测试工具
+
+models/speed/model_utils_speed.py
+  作用：速度优化的模型工具（BatchNorm 融合到卷积中用于延迟测试）
+  角色：速度测试专用工具模块
+
+================================================================================
+四、datasets/ -- 数据集加载器目录
+================================================================================
+
+datasets/__init__.py
+  作用：导入 Cityscapes、CamVid 和自定义数据集类
+  角色：数据集包初始化文件
+
+datasets/base_dataset.py
+  作用：基础数据集类，包含共享的数据变换
+      （输入归一化、随机裁剪、多尺度增强、通过 Canny 生成边缘）
+  角色：通用数据集功能基类
+
+datasets/cityscapes.py
+  作用：Cityscapes 数据集加载器（19类，标签ID映射，基于颜色的标签转换）
+  角色：Cityscapes 数据加载
+
+datasets/camvid.py
+  作用：CamVid 数据集加载器（11类，RGB 颜色到标签的转换）
+  角色：CamVid 数据加载
+
+datasets/custom.py
+  作用：自定义电力线路数据集加载器
+      （3类：背景/电力线/塔，强制调整为512x512，类别权重 [0.02, 0.60, 0.38]）
+  角色：电力线路数据加载
+
+datasets/readme.txt
+  作用：一行说明："Implementation of Pytorch Dataset for Cityscapes and CamVid."
+  角色：文档说明
+
+================================================================================
+五、tools/ -- 训练和评估脚本目录
+================================================================================
+
+tools/_init_paths.py
+  作用：将父目录添加到 sys.path 以支持模块导入
+  角色：路径初始化工具
+
+tools/train.py
+  作用：主训练脚本：加载配置、构建模型/数据集、使用 SGD+多项式学习率训练、
+      保存检查点和最佳模型
+  角色：训练流水线
+
+tools/eval.py
+  作用：评估脚本：加载训练好的模型，运行 testval 或 test 模式，报告 mIoU/像素准确率
+  角色：标准评估工具
+
+tools/evaluate.py
+  作用：综合评估脚本：计算 mIoU、F1、精确率、召回率、边界IoU、宽松IoU；
+      生成混淆矩阵、各类别柱状图、训练曲线、CSV 输出
+  角色：带边界指标的扩展评估工具
+
+tools/custom.py
+  作用：自定义推理脚本：在指定目录的图像上运行 PIDNet，保存彩色编码的预测结果
+  角色：单图推理工具
+
+tools/filter_empty_images.py
+  作用：从训练/验证/测试列表文件中过滤纯背景图像，防止 NaN 和 mIoU 偏差
+  角色：数据清洗工具
+
+tools/compute_class_weights.py
+  作用：计算各类别像素比例，推荐逆频率和中位数频率类别权重用于损失函数
+  角色：类别权重计算工具
+
+================================================================================
+六、utils/ -- 训练工具目录
+================================================================================
+
+utils/__init__.py
+  作用：空文件
+  角色：包初始化文件
+
+utils/criterion.py
+  作用：损失函数定义：CrossEntropy、OhemCrossEntropy（带 OHEM 困难样本挖掘）、
+      weighted_bce、BondaryLoss（边界感知 BCE 损失，带 NaN 保护）
+  角色：损失函数定义
+
+utils/criterion_v5.py
+  作用：扩展的损失函数，新增 MCCLoss（马修斯相关系数损失）用于抑制假阳性；
+      以 0.1 权重融合 OHEM + MCC；包含 NaN 保护和空类别豁免
+  角色：带 MCC 的增强损失函数
+
+utils/function.py
+  作用：训练/验证循环：train()（带 NaN 保护和梯度裁剪）、
+      validate()（带各类别 IoU 日志）、testval()、test()
+  角色：核心训练/评估循环
+
+utils/utils.py
+  作用：工具类：FullModel（将模型与损失封装）、AverageMeter、create_logger、
+      get_confusion_matrix、adjust_learning_rate（多项式学习率调度）
+  角色：训练基础设施
+
+================================================================================
+七、data/ -- 数据集存储目录
+================================================================================
+
+---------- data/camvid/ 和 data/cityscapes/ ----------
+  作用：占位目录，包含 readme.txt 文件，指示在哪里放置下载的数据集
+  角色：数据集占位符
+
+---------- data/list/ -- 数据集划分列表 ----------
+
+data/list/cityscapes/train.lst
+  作用：Cityscapes 训练集图像-标签对（制表符分隔）
+  角色：训练集划分
+
+data/list/cityscapes/val.lst
+  作用：Cityscapes 验证集对
+  角色：验证集划分
+
+data/list/cityscapes/test.lst
+  作用：Cityscapes 测试集图像路径
+  角色：测试集划分
+
+data/list/cityscapes/trainval.lst
+  作用：Cityscapes 训练+验证集合并
+  角色：trainval 划分
+
+data/list/camvid/train.lst
+  作用：CamVid 训练集对
+  角色：训练集划分
+
+data/list/camvid/val.lst
+  作用：CamVid 验证集对
+  角色：验证集划分
+
+data/list/camvid/test.lst
+  作用：CamVid 测试集对
+  角色：测试集划分
+
+data/list/camvid/trainval.lst
+  作用：CamVid 训练+验证集合并
+  角色：trainval 划分
+
+---------- data/PIDNet_Power_Dataset/ -- 自定义电力线路数据集 ----------
+  总计约 104,181 个文件，分布在以下子目录中：
+
+  images/      -- 38,039 训练 / 4,884 验证 / 5,052 测试 -- 512x512 裁剪后的图像块
+  masks/       -- 38,039 训练 / 4,884 验证 / 5,052 测试 -- 对应的分割掩码（0=背景，1=电力线，2=塔）
+  mother_images/ -- 2,992 训练 / 372 验证 / 378 测试 -- 原始全分辨率源图像
+  mother_masks/  -- 2,992 训练 / 372 验证 / 378 测试 -- 原始全分辨率源掩码
+  list/          -- train.txt, val.txt, test.txt 索引文件
+  pidnet_poweryaml推理结果/ -- 推理结果（val_inference_masks, val_inference_vis）
+
+================================================================================
+八、pretrained_models/ -- 预训练模型权重
+================================================================================
+
+pretrained_models/cityscapes/PIDNet_S_Cityscapes_val.pt
+  作用：在 Cityscapes 验证集上训练的 PIDNet-S 权重
+  角色：用于迁移学习的预训练骨干网络
+
+pretrained_models/imagenet/PIDNet_L_ImageNet.pth.tar
+  作用：PIDNet-L ImageNet 预训练权重
+  角色：ImageNet 预训练模型
+
+pretrained_models/camvid/readme.txt
+  作用：占位文件
+  角色：CamVid 权重目录
+
+pretrained_models/cityscapes/readme.txt
+  作用：占位文件
+  角色：Cityscapes 权重目录
+
+pretrained_models/imagenet/readme.txt
+  作用：占位文件
+  角色：ImageNet 权重目录
+
+================================================================================
+九、output/ -- 训练输出目录
+================================================================================
+
+output/custom/pidnet_power/best.pt
+  作用：首次电力训练的最佳模型权重
+
+output/custom/pidnet_power/final_state.pt
+  作用：首次训练的最终模型状态
+
+output/custom/pidnet_power/checkpoint.pth.tar
+  作用：首次训练的可恢复检查点
+
+output/custom/pidnet_power/pidnet_power_2026-04-29-12-51_train.log
+  作用：训练日志
+
+output/custom/pidnet_power/pidnet_comprehensive_analysis.png
+  作用：分析可视化图
+
+output/custom/pidnet_power/第一次训练/
+  作用：首次训练运行的产物（best.pt, final_state.pt, checkpoint.pth.tar, training_curves.png, train.log）
+
+output/custom/pidnet_large_a100/
+  作用：PIDNet-L A100 训练输出（train.log, metrics.png）
+
+output/custom/v2/
+  作用：PIDNet-L v2 训练日志（2个日志文件）
+
+output/custom/v3/
+  作用：PIDNet-L v3 训练日志
+
+output/custom/pidnet_small_local_v1/
+  作用：PIDNet-S 本地 v1 输出（best.pt, checkpoint.pth.tar, train.log）
+
+output/cityscapes/pidnet_small_cityscapes/
+  作用：Cityscapes 基线训练日志（2个日志文件）
+
+================================================================================
+十、log/ -- TensorBoard 日志目录
+================================================================================
+
+  作用：包含 19 个 TensorBoard 事件文件，涵盖 pidnet_s、pidnet_l、
+      cityscapes 和自定义电力实验的训练过程（2026-04-26 至 2026-06-03）
+  角色：训练过程可视化日志
+
+================================================================================
+十一、samples/ -- 样本图像目录
+================================================================================
+
+samples/frankfurt_000000_002196_leftImg8bit.png
+  作用：Cityscapes 样本输入图像
+
+samples/frankfurt_000000_003025_leftImg8bit.png
+  作用：Cityscapes 样本输入图像
+
+samples/2.png 和 samples/3.png
+  作用：额外的样本图像
+
+samples/outputs/
+  作用：推理输出可视化（4个文件）
+
+================================================================================
+十二、figs/ -- 文档插图目录
+================================================================================
+
+figs/pidnet.jpg
+  作用：PIDNet 架构图
+
+figs/pidnet_table.jpg
+  作用：PIDNet 实例化表格
+
+figs/cityscapes_score.jpg
+  作用：Cityscapes 准确率与速度对比图
+
+figs/prediction.jpg
+  作用：预测可视化图
+
+figs/video1_all.gif
+  作用：演示视频1（Cityscapes Stuttgart）
+
+figs/video2_all.gif
+  作用：演示视频2（Cityscapes Stuttgart）
+
+================================================================================
+十三、修改版本/ -- 修改版本备份目录
+================================================================================
+
+修改版本/修改v3/pidnet.py
+  作用：带 SPM + ODConv 的 PIDNet（与主目录 pidnet.py 相同）
+  角色：v3 模型的服务器备份
+
+修改版本/修改v3/model_utils.py
+  作用：带 StripPooling + ODConv2d + ODConvBasicBlock 的模型工具
+  角色：v3 工具的服务器备份
+
+修改版本/修改v3/evaluate.py
+  作用：综合评估脚本（与 tools/evaluate.py 相同）
+  角色：评估脚本的服务器备份
+
+修改版本/修改v3/pidnet_large_a100_v3.yaml
+  作用：PIDNet-L v3 A100 配置（与 configs/power/pidnet_large_a100_v3.yaml 相同）
+  角色：配置文件的服务器备份
+
+修改版本/修改v3/服务器上先备份一个只有spm的.txt
+  作用：空文件（标记说明："服务器上备份仅含SPM的版本"）
+  角色：标记文件
+
+================================================================================
+十四、IDE/工具配置目录
+================================================================================
+
+.vscode/settings.json
+  作用：VS Code Python 环境设置（conda）
+  角色：IDE 配置
+
+.claude/settings.local.json
+  作用：Claude Code 权限和工具配置
+  角色：AI 工具配置
+
+================================================================================
+十五、消融实验版本总结
+================================================================================
+
+本项目维护了一个清晰的消融实验结构：
+
+  v4 (pidnet_v4.py)       -- 基线 PIDNet：无 SPM，无 ODConv
+  v2 (pidnet_v2.py)       -- 基线 + 仅 SPM（条带池化模块）
+  v3 (pidnet_v3.py)       -- 基线 + SPM + 原始 ODConv（无坐标注意力）
+  v1/活跃版 (pidnet.py)   -- 基线 + SPM + CA_ODConv2d（坐标注意力 + ODConv）
+
+每个版本都有对应的 model_utils_vN.py 提供必要的构建模块。
+当前活跃的 pidnet.py 和 model_utils.py 代表了集成所有改造的最先进版本。
+
+================================================================================
+                          清单生成日期：2026年6月4日
+================================================================================

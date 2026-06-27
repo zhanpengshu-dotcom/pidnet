@@ -1,0 +1,73 @@
+# PIDNet-Small config for A100 80GB server
+# 基于 PIDNet-Large v3 配置修改，适配 PIDNet-S 轻量化模型
+#
+# 与 pidnet_large_a100_v3.yaml 的区别：
+#   - MODEL.NAME: pidnet_s（自动加载 planes=32 的轻量架构）
+#   - PRETRAINED: PIDNet_S_Cityscapes_val.pt（Cityscapes 预训练权重）
+#   - BATCH_SIZE_PER_GPU: 128（PIDNet-S 参数量仅 6.4M，A100 显存充裕，可加大 batch）
+#   - 其余训练策略（LR、OHEM、数据增强等）与 PIDNet-L 保持一致，确保公平对比
+#
+# 需要下载的预训练权重：
+#   PIDNet_S_Cityscapes_val.pt → 放到 pretrained_models/cityscapes/
+#   下载地址: https://github.com/XuJiacong/PIDNet
+
+CUDNN:
+  BENCHMARK: true
+  DETERMINISTIC: false
+  ENABLED: true
+GPUS: (0,)
+OUTPUT_DIR: 'output'
+LOG_DIR: 'log'
+WORKERS: 8
+PRINT_FREQ: 100
+
+DATASET:
+  DATASET: custom
+  ROOT: 'data/PIDNet_Power_Dataset'
+  TEST_SET: 'list/val.txt'
+  TRAIN_SET: 'list/train.txt'
+  NUM_CLASSES: 3
+
+MODEL:
+  NAME: pidnet_s
+  NUM_OUTPUTS: 2
+  # PIDNet-S Cityscapes 预训练权重
+  # 需从 https://github.com/XuJiacong/PIDNet 下载
+  PRETRAINED: 'pretrained_models/cityscapes/PIDNet_S_Cityscapes_val.pt'
+
+LOSS:
+  USE_OHEM: true
+  OHEMTHRES: 0.9
+  OHEMKEEP: 200000
+  BALANCE_WEIGHTS: [0.4, 1.0]
+  SB_WEIGHTS: 0.1
+
+TRAIN:
+  IMAGE_SIZE:
+  - 512
+  - 512
+  BASE_SIZE: 640
+  # PIDNet-S + 512x512 + batch=128 ~ 12-16GB VRAM（A100 80GB 绰绰有余）
+  # PIDNet-S 参数量仅 6.4M（PIDNet-L 为 20.5M），显存占用约 1/3
+  BATCH_SIZE_PER_GPU: 128
+  SHUFFLE: true
+  BEGIN_EPOCH: 0
+  END_EPOCH: 300
+  IGNORE_LABEL: 255
+  OPTIMIZER: sgd
+  LR: 0.01
+  WD: 0.0005
+  MOMENTUM: 0.9
+  NESTEROV: false
+  FLIP: true
+  MULTI_SCALE: true
+  SCALE_FACTOR: 16
+
+TEST:
+  IMAGE_SIZE:
+  - 512
+  - 512
+  BASE_SIZE: 640
+  BATCH_SIZE_PER_GPU: 32
+  FLIP_TEST: false
+  MULTI_SCALE: false

@@ -1,0 +1,591 @@
+请基于当前 PIDNet-S 项目实现 BMHR-PIDNet-v3A。注意，本次不是继续修改 DGA-PAPPM，也不是直接实现复杂 FFT 频域模块，而是在保留 PIDNet-S 原始 PAPPM 的前提下，在 P branch 的 1/8 高分辨率特征上加入一个轻量的边界引导多尺度高频细节增强模块。
+
+本次目标是做一个低风险、任务对齐、可解释的结构消融。不要加入新 loss，不要改训练策略，不要替换 PAPPM，不要修改 baseline 文件。
+
+一、实验背景
+
+当前任务是无人机输电通道语义分割，类别为：
+
+0 background
+1 powerline / transmission line
+2 wooden tower
+3 lattice / steel tower
+4 other / tucohy tower
+255 ignore
+
+当前 baseline 是 PIDNet-S，使用 Cityscapes 预训练权重，5 类输出，OHEM 训练。之前已经实现并训练过 HDP-DGA-v1，即直接用 DGA-PAPPM 替换原 PAPPM。该版本可以正常训练和推理，但 best mIoU 与 baseline 基本持平，没有形成稳定提升。主要问题包括：
+
+1. DGA-PAPPM 直接替换 PAPPM，导致原 `spp.*` 预训练权重不能继承；
+2. 改动位置位于 I branch 深层低分辨率特征，对输电线、细杆塔等细小结构帮助有限；
+3. 全局 gate 不能实现空间位置级自适应；
+4. 直接替换 PAPPM 牺牲了原 PIDNet-S 稳定的多尺度上下文表达。
+
+因此 v3A 不再替换 PAPPM，而是保留 PAPPM，在 P branch 的 1/8 高分辨率特征上增加一个 zero-init residual 形式的 BMHR 模块。
+
+二、BMHR 模块设计动机
+
+模块名称：
+
+BMHR = Boundary-guided Multi-scale High-frequency Refinement
+中文：边界引导多尺度高频细节增强模块
+
+设计依据：
+
+1. powerline 是细长高频结构，容易在下采样中断裂；
+2. wooden tower 通常细、小、弱纹理，容易与树影、道路纹理、电线混淆；
+3. other/tucohy tower 形态变化大，有时是大横臂，有时是细长单杆，需要多尺度建模；
+4. lattice tower 已经较好，不能因为增强其他类别导致 lattice 明显下降；
+5. PIDNet 原本有 P/I/D 三分支，其中 P branch 保留细节，D branch 提供边界信息，因此在 P branch 上用 D branch 引导增强比在低分辨率 I branch 里替换 PAPPM 更合理；
+6. 高频增强容易误增强树影、草地、道路纹理等背景噪声，因此需要 D branch 做空间 gate 引导；
+7. BMHR 必须采用 zero-init residual，保证模型初始行为接近 baseline，降低破坏预训练模型的风险。
+
+三、严禁修改的文件
+
+不要修改以下 baseline 文件：
+
+1. `models/pidnet.py`
+2. `models/model_utils.py`
+3. `models/__init__.py`
+4. `tools/train.py`
+5. `configs/default.py`
+6. `configs/power/pidnet_small_local_5_v1.yaml`
+7. `utils/utils.py`
+8. `utils/criterion.py`
+
+也不要覆盖已有 v1/v2 文件，例如：
+
+1. `models/pidnet_hdp.py`
+2. `models/hdp_modules.py`
+3. `tools/train_hdp.py`
+4. `configs/default_hdp.py`
+5. `configs/power/pidnet_small_local_5_dga_pappm_v1.yaml`
+6. 其他已有 HDP v1/v2 文件
+
+四、本次新增文件
+
+请新增以下文件：
+
+1. `models/hdp_modules_v3a.py`
+2. `models/pidnet_hdp_v3a.py`
+3. `configs/default_hdp_v3a.py`
+4. `tools/train_hdp_v3a.py`
+5. `configs/power/pidnet_small_local_5_bmhr_v3a.yaml`
+6. `tools/test_hdp_v3a_forward.py`
+7. `tools/compare_hdp_v3a_complexity.py`
+
+如果项目中已经存在 `utils/utils_hdp.py` 并且其中的 `FullModelHDP` 已经解决了 `IGNORE_LABEL=255` 与 boundary label 不一致问题，请继续复用它。不要修改 baseline 的 `utils/utils.py`。
+
+五、实现 BMHR 模块
+
+请在 `models/hdp_modules_v3a.py` 中实现：
+
+```python
+class BMHR(nn.Module):
+    def __init__(
+        self,
+        channels,
+        reduction=4,
+        use_boundary_gate=True,
+        zero_init=True
+    ):
+        ...
+```
+
+输入：
+
+```python
+p: P branch feature, shape [B, C, H, W]
+d: D branch feature, shape [B, C, H, W]
+```
+
+输出：
+
+```python
+enhanced_p: shape [B, C, H, W]
+```
+
+对于 PIDNet-S，`channels=128`。
+
+BMHR 内部结构如下：
+
+1. reduce 层
+
+```text
+1×1 Conv + BN + ReLU
+channels -> mid
+mid = max(channels // reduction, 16)
+```
+
+2. local branch
+
+```text
+depthwise 3×3 Conv + BN + ReLU
+```
+
+作用：增强局部细节、细杆、细线。
+
+3. medium branch
+
+```text
+depthwise 3×3 Conv, dilation=2, padding=2 + BN + ReLU
+```
+
+作用：增强横担、局部塔臂、局部杆塔结构。
+
+4. large branch
+
+```text
+depthwise 3×3 Conv, dilation=3, padding=3 + BN + ReLU
+```
+
+作用：增强更大范围的杆塔局部上下文和 other 类多形态结构。
+
+5. high-frequency branch
+
+本次不要使用 FFT。
+请使用固定 Laplacian 或 Sobel-like high-pass depthwise filter。
+
+要求：
+
+1. high-pass filter 不参与训练，或者初始化为 Laplacian 后 `requires_grad=False`；
+2. high-pass 后接 `3×3 depthwise Conv + BN + ReLU`；
+3. 该分支用于增强输电线、细杆、杆塔边界和横担边缘；
+4. 不要把高频分支做得很重。
+
+推荐 Laplacian kernel：
+
+```python
+[[0, -1, 0],
+ [-1, 4, -1],
+ [0, -1, 0]]
+```
+
+也可以使用八邻域版本：
+
+```python
+[[-1, -1, -1],
+ [-1,  8, -1],
+ [-1, -1, -1]]
+```
+
+选择一种即可，保持实现简单。
+
+6. spatial gate
+
+如果 `use_boundary_gate=True`：
+
+```python
+gate_input = torch.cat([p, d], dim=1)
+```
+
+如果 `use_boundary_gate=False` 或 `d is None`：
+
+```python
+gate_input = p
+```
+
+gate 输出：
+
+```python
+[B, 4, H, W]
+```
+
+对应四个分支：
+
+1. local
+2. medium
+3. large
+4. high-frequency
+
+使用：
+
+```python
+weights = torch.softmax(gate_logits, dim=1)
+```
+
+注意：这里必须是空间 gate，即 `[B, 4, H, W]`，不要做成全局 `[B, 4, 1, 1]`。
+
+7. fusion
+
+```python
+fused = (
+    weights[:, 0:1] * b1 +
+    weights[:, 1:2] * b2 +
+    weights[:, 2:3] * b3 +
+    weights[:, 3:4] * b4
+)
+```
+
+8. expand 层
+
+```text
+1×1 Conv + BN
+mid -> channels
+```
+
+9. zero initialization
+
+如果 `zero_init=True`，请将 expand 中最后一个 BN 的 weight 初始化为 0。
+或者使用 learnable scalar `alpha`，初始化为 0。
+
+目标是使模块初始时近似恒等映射：
+
+```python
+BMHR(p, d) ≈ p
+```
+
+推荐 forward 逻辑：
+
+```python
+res = self.reduce(p)
+
+b1 = self.local(res)
+b2 = self.medium(res)
+b3 = self.large(res)
+b4 = self.high_freq(res)
+
+weights = self.gate(p, d)
+
+fused = (
+    weights[:, 0:1] * b1 +
+    weights[:, 1:2] * b2 +
+    weights[:, 2:3] * b3 +
+    weights[:, 3:4] * b4
+)
+
+residual = self.expand(fused)
+
+return p + residual
+```
+
+六、pidnet_hdp_v3a.py 修改要求
+
+请从 `models/pidnet.py` 复制生成：
+
+`models/pidnet_hdp_v3a.py`
+
+只在新文件中修改。
+
+新增导入：
+
+```python
+from .hdp_modules_v3a import BMHR
+```
+
+在 `PIDNet.__init__()` 中新增参数：
+
+```python
+use_bmhr=False
+bmhr_reduction=4
+bmhr_use_boundary_gate=True
+bmhr_zero_init=True
+```
+
+在初始化中添加：
+
+```python
+if use_bmhr:
+    self.bmhr = BMHR(
+        channels=planes * 4,
+        reduction=bmhr_reduction,
+        use_boundary_gate=bmhr_use_boundary_gate,
+        zero_init=bmhr_zero_init
+    )
+else:
+    self.bmhr = nn.Identity()
+```
+
+对于 PIDNet-S，`planes=32`，因此 `planes * 4 = 128`，与 P branch 最终输出通道一致。
+
+forward 中找到原始逻辑：
+
+```python
+x_ = self.layer5_(self.relu(x_))
+x_d = self.layer5_d(self.relu(x_d))
+x = F.interpolate(
+    self.spp(self.layer5(x)),
+    size=[height_output, width_output],
+    mode='bilinear',
+    align_corners=algc
+)
+
+x_ = self.final_layer(self.dfm(x_, x, x_d))
+```
+
+请改为：
+
+```python
+x_ = self.layer5_(self.relu(x_))
+x_d = self.layer5_d(self.relu(x_d))
+
+x_ = self.bmhr(x_, x_d)
+
+x = F.interpolate(
+    self.spp(self.layer5(x)),
+    size=[height_output, width_output],
+    mode='bilinear',
+    align_corners=algc
+)
+
+x_ = self.final_layer(self.dfm(x_, x, x_d))
+```
+
+注意：
+
+1. 不要替换 `self.spp`；
+2. `self.spp` 必须仍然是原 PAPPM；
+3. 不要修改 P branch 主体；
+4. 不要修改 I branch 主体；
+5. 不要修改 D branch 主体；
+6. 不要修改 PagFM；
+7. 不要修改 Light_Bag；
+8. 不要修改 final_layer；
+9. 不要修改 seghead_p；
+10. 不要修改 seghead_d；
+11. 不要修改输出格式；
+12. 训练时仍返回 `[x_extra_p, x_, x_extra_d]`。
+
+七、get_seg_model 修改要求
+
+在 `models/pidnet_hdp_v3a.py` 的 `get_seg_model()` 中读取配置：
+
+```python
+use_bmhr = cfg.MODEL.USE_BMHR
+bmhr_reduction = cfg.MODEL.BMHR_REDUCTION
+bmhr_use_boundary_gate = cfg.MODEL.BMHR_USE_BOUNDARY_GATE
+bmhr_zero_init = cfg.MODEL.BMHR_ZERO_INIT
+```
+
+实例化 PIDNet-S 时传入：
+
+```python
+use_bmhr=use_bmhr,
+bmhr_reduction=bmhr_reduction,
+bmhr_use_boundary_gate=bmhr_use_boundary_gate,
+bmhr_zero_init=bmhr_zero_init
+```
+
+八、预训练权重加载要求
+
+请沿用之前清晰的加载日志字段：
+
+1. `loaded`
+2. `checkpoint_not_used`
+3. `shape_mismatch`
+4. `model_not_loaded`
+5. `expected_random_init`
+
+v3A 预期：
+
+1. 原 `spp.*` 应尽量成功加载；
+2. 新增 `bmhr.*` 应进入 `expected_random_init`；
+3. `seghead_p.conv2.*` 和 `final_layer.conv2.*` 因 Cityscapes 19 类到当前 5 类发生 shape mismatch 是预期现象；
+4. 不应出现大量 `layer1-layer5`、P branch、D branch、PagFM、Light_Bag、diff、dfm 未加载。
+
+`expected_random_init` 主要包括：
+
+```text
+bmhr.*
+seghead_p.conv2.*
+final_layer.conv2.*
+```
+
+注意：v3A 中不应该把原 PAPPM 的大量 `spp.scale*`、`spp.compression*`、`spp.shortcut*` 作为 expected random init，因为 PAPPM 被保留，理论上这些权重应能加载。
+
+九、配置系统
+
+请从 `configs/default_hdp.py` 或 `configs/default.py` 复制生成：
+
+`configs/default_hdp_v3a.py`
+
+不要修改原始配置文件。
+
+在新配置中增加：
+
+```python
+_C.MODEL.USE_BMHR = False
+_C.MODEL.BMHR_REDUCTION = 4
+_C.MODEL.BMHR_USE_BOUNDARY_GATE = True
+_C.MODEL.BMHR_ZERO_INIT = True
+```
+
+十、新 YAML
+
+请从 baseline yaml 复制生成：
+
+`configs/power/pidnet_small_local_5_bmhr_v3a.yaml`
+
+保持所有训练参数与 baseline 完全一致，只增加 BMHR 相关字段。
+
+MODEL 部分建议为：
+
+```yaml
+MODEL:
+  NAME: pidnet_s
+  NUM_OUTPUTS: 2
+  PRETRAINED: pretrained_models/cityscapes/PIDNet_S_Cityscapes_val.pt
+  USE_BMHR: true
+  BMHR_REDUCTION: 4
+  BMHR_USE_BOUNDARY_GATE: true
+  BMHR_ZERO_INIT: true
+```
+
+不要修改以下内容：
+
+1. LR；
+2. batch size；
+3. OHEM；
+4. epoch；
+5. class weights；
+6. data path；
+7. crop size；
+8. loss 配置；
+9. optimizer；
+10. augment 设置。
+
+十一、训练入口
+
+请从 `tools/train_hdp.py` 或 `tools/train.py` 复制生成：
+
+`tools/train_hdp_v3a.py`
+
+要求：
+
+1. 使用 `configs/default_hdp_v3a.py`；
+2. 使用 `models.pidnet_hdp_v3a.get_seg_model(...)`；
+3. 使用 HDP 专用的 `FullModelHDP`，避免 ignore label 不一致问题；
+4. 不要导入无用的 `import models`；
+5. 不要修改 baseline 的 `tools/train.py`。
+
+如果项目中已有：
+
+```python
+from utils.utils_hdp import FullModelHDP
+```
+
+请继续使用。
+
+十二、forward 测试脚本
+
+请新增：
+
+`tools/test_hdp_v3a_forward.py`
+
+要求：
+
+1. 不加载预训练权重；
+2. 直接实例化 `pidnet_hdp_v3a.PIDNet(...)`；
+3. 输入 `torch.randn(1, 3, 512, 512)`；
+4. 使用 `model.eval()`；
+5. 检查输出是 list；
+6. 检查 list 长度为 3；
+7. 检查主输出通道数为 5；
+8. 检查主输出 shape 为 `[1, 5, 64, 64]`；
+9. 打印 `forward ok`。
+
+十三、参数量统计脚本
+
+请新增：
+
+`tools/compare_hdp_v3a_complexity.py`
+
+至少比较：
+
+1. PIDNet-S baseline；
+2. HDP-DGA-v1，如果方便；
+3. BMHR-PIDNet-v3A。
+
+输出：
+
+```text
+PIDNet-S baseline Params
+HDP-DGA-v1 Params
+BMHR-PIDNet-v3A Params
+Delta v3A - baseline
+Trainable Params
+FLOPs: TODO
+FPS: TODO
+```
+
+十四、暂时不要加入以下内容
+
+本次不要加入：
+
+1. FFT；
+2. Rare Dice；
+3. MCC loss；
+4. Sobel loss；
+5. clDice；
+6. EMA；
+7. checkpoint averaging；
+8. class weights；
+9. LCEG；
+10. BAFM-P；
+11. Transformer；
+12. Mamba；
+13. ODConv；
+14. 新数据增强；
+15. 后处理；
+16. 修改 split。
+
+本次只验证：
+
+```text
+P branch 1/8 feature + multi-scale depthwise conv + high-pass branch + D branch boundary-guided spatial gate + zero-init residual
+```
+
+十五、运行测试
+
+完成后请运行：
+
+```bash
+python -m py_compile models/hdp_modules_v3a.py models/pidnet_hdp_v3a.py configs/default_hdp_v3a.py tools/train_hdp_v3a.py tools/test_hdp_v3a_forward.py tools/compare_hdp_v3a_complexity.py
+```
+
+如果有完整环境，请继续运行：
+
+```bash
+python tools/test_hdp_v3a_forward.py
+python tools/compare_hdp_v3a_complexity.py
+python tools/train_hdp_v3a.py --cfg configs/power/pidnet_small_local_5_bmhr_v3a.yaml TRAIN.END_EPOCH 2
+```
+
+十六、完成后输出报告
+
+请输出：
+
+1. 新增文件列表；
+2. 修改文件列表；
+3. 是否未修改 baseline 文件；
+4. 是否未修改已有 v1/v2 文件；
+5. BMHR 插入位置；
+6. PAPPM 是否保留；
+7. `spp.*` 预训练权重是否成功加载；
+8. `bmhr.*` 是否为 expected random init；
+9. `seghead_p.conv2.*` 和 `final_layer.conv2.*` 是否因 19 类到 5 类发生 shape mismatch；
+10. forward 测试结果；
+11. 参数量变化；
+12. 2 epoch smoke test 结果；
+13. 是否可以进入 80/120 epoch screening。
+
+十七、进入下一阶段的判断标准
+
+本次只实现和验证 v3A。不要直接跑 loss，也不要实现 FFT。
+
+v3A 通过 2 epoch smoke test 后，我会先跑 80 或 120 epoch screening。进入完整 300 epoch 的条件为：
+
+满足以下任意一个：
+
+1. mIoU 相比 baseline 同期提升 ≥ 0.3 个百分点；
+2. powerline IoU 提升 ≥ 0.7 个百分点，且 mIoU 不明显下降；
+3. wooden tower 和 other tower 平均 IoU 提升 ≥ 1.0 个百分点，且 lattice tower 不明显下降；
+4. 可视化中输电线断裂减少或杆塔边界更完整，且数值指标没有明显劣化。
+
+如果出现以下情况，则停止该版本，不进入完整训练：
+
+1. mIoU 下降 > 0.5 个百分点；
+2. lattice tower 下降 > 1.0 个百分点；
+3. background 明显下降；
+4. powerline、wooden、other 均无提升；
+5. 参数量或速度开销明显不可接受；
+6. 训练波动明显大于 baseline。

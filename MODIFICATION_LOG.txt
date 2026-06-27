@@ -1,0 +1,340 @@
+================================================================================
+  PIDNet 代码修改记录
+  输电走廊场景电力线与杆塔分割项目
+================================================================================
+  说明：本文件仅记录代码修改内容及解释。每次新增或修改模块时在此记录。
+================================================================================
+
+
+================================================================================
+  修改一：条形池化模块（Strip Pooling Module, SPM）
+  日期：2026-05-16
+  文件：models/model_utils.py, models/pidnet.py
+  目的：增强电力线连续性，抑制树枝假阳性
+================================================================================
+
+【1】models/model_utils.py — 新增 StripPooling 类
+
+位置：第381行（Bag类之后）
+
+代码：
+class StripPooling(nn.Module):
+    def __init__(self, in_channels):
+        super(StripPooling, self).__init__()
+        mid_channels = in_channels // 4
+        self.pool_h = nn.AdaptiveAvgPool2d((1, None))       # 水平条形池化：压缩高度至1，保留宽度
+        self.fc_h = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, 1, bias=False),
+            nn.BatchNorm2d(mid_channels, momentum=bn_mom),
+            nn.ReLU(inplace=True)
+        )
+        self.pool_w = nn.AdaptiveAvgPool2d((None, 1))       # 垂直条形池化：压缩宽度至1，保留高度
+        self.fc_w = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, 1, bias=False),
+            nn.BatchNorm2d(mid_channels, momentum=bn_mom),
+            nn.ReLU(inplace=True)
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(mid_channels * 2, in_channels, 1, bias=False),
+            nn.BatchNorm2d(in_channels, momentum=bn_mom)
+        )
+        nn.init.constant_(self.fuse[1].weight, 0)            # 零初始化BN gamma
+
+    def forward(self, x):
+        n, c, h, w = x.size()
+        feat_h = self.pool_h(x)                              # (N, C, 1, W)
+        feat_h = self.fc_h(feat_h)                            # (N, C//4, 1, W)
+        feat_h = F.interpolate(feat_h, size=(h, w), mode='bilinear', align_corners=algc)
+        feat_w = self.pool_w(x)                               # (N, C, H, 1)
+        feat_w = self.fc_w(feat_w)                            # (N, C//4, H, 1)
+        feat_w = F.interpolate(feat_w, size=(h, w), mode='bilinear', align_corners=algc)
+        out = self.fuse(torch.cat([feat_h, feat_w], dim=1))   # (N, C, H, W)
+        return x + out                                        # 残差连接
+
+解释：
+  - AdaptiveAvgPool2d((1, None))：将H维压缩为1，保留W维 → 沿水平方向聚合上下文
+  - AdaptiveAvgPool2d((None, 1))：将W维压缩为1，保留H维 → 沿垂直方向聚合上下文
+  - fc_h/fc_w：1x1卷积降维至 in_channels//4，减少计算量
+  - fuse：拼接两个方向特征后1x1卷积恢复原始通道数
+  - nn.init.constant_(self.fuse[1].weight, 0)：零初始化fuse层的BN gamma
+    → 初始时 fuse 输出全0 → SPM等效于恒等映射（return x + 0 = x）
+    → 不破坏预训练的D分支特征，训练过程中逐渐学习方向性上下文
+
+【2】models/pidnet.py — 在D分支输出处插入SPM
+
+修改1 — 第8行，import添加StripPooling：
+  原：from .model_utils import BasicBlock, Bottleneck, segmenthead, DAPPM, PAPPM, PagFM, Bag, Light_Bag
+  改：from .model_utils import BasicBlock, Bottleneck, segmenthead, DAPPM, PAPPM, PagFM, Bag, Light_Bag, StripPooling
+
+修改2 — 第87行附近，__init__中layer5_d之后添加：
+  self.spm = StripPooling(planes * 4)
+  解释：planes*4是D分支输出通道数（PIDNet-S: 32*4=128, PIDNet-L: 64*4=256）
+
+修改3 — 第173行附近，forward中layer5_d输出后、dfm调用前添加：
+  x_d = self.spm(x_d)
+  解释：在D分支特征送入Bag融合前，用SPM增强方向性上下文
+  数据流：layer5_d → SPM → sigmoid(x_d)作为空间注意力门控 → Bag → final_layer
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+  修改二：全维动态卷积（ODConv） vs 可变形卷积（DCNv2） 分析
+  日期：2026-05-16
+  待解决的问题：杆塔材质（水泥、木质、角钢）纹理差异导致分割失效
+================================================================================
+
+【PIDNet原始conv2是什么？】
+
+PIDNet的BasicBlock中conv2是标准3x3卷积：
+  self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, padding=1, bias=False)
+  → 固定权重的3x3卷积核，不随输入内容变化
+  → 对所有材质（水泥/木质/角钢）使用完全相同的特征提取方式
+  → 无法自适应不同材质的纹理差异
+
+【DCNv2与ODConv的核心区别】
+
+DCNv2（可变形卷积 v2，ICCV 2017）：
+  核心操作：学习每个采样点的空间偏移量(offset)，卷积核权重不变
+  数学表达：y(p) = Σ w_k · x(p + p_k + Δp_k) · Δm_k
+    - w_k：固定卷积核权重（不随输入变化）
+    - p_k：原始采样位置
+    - Δp_k：学习的空间偏移（输入依赖）
+    - Δm_k：学习的调制标量（输入依赖）
+  本质：改变"在哪里采样"，不改变"用什么权重采样"
+  擅长：几何形变（目标尺度/姿态/位置变化）
+
+ODConv（全维动态卷积，ICLR 2022）：
+  核心操作：通过4D注意力动态调制整个卷积核权重
+  数学表达：y(p) = Σ [w_k ⊙ α_s ⊙ α_c ⊙ α_f ⊙ α_n] · x(p + p_k)
+    - w_k：静态卷积核权重
+    - α_s：空间注意力（逐位置调制）
+    - α_c：输入通道注意力（逐通道调制）
+    - α_f：输出通道注意力（逐滤波器调制）
+    - α_n：核级注意力（逐滤波器整体调制）
+  本质：改变"用什么权重采样"，采样位置不变
+  擅长：纹理判别（不同材质/风格的内容自适应）
+
+【对杆塔材质问题的适配性分析】
+
+水泥杆特征：表面粗糙、灰白色、有横向浇筑痕迹、圆柱形
+木质杆特征：表面有纵向木纹、颜色偏棕、有树结/裂纹、圆柱形
+角钢塔特征：金属质感、规则几何结构、有螺栓/焊缝、角钢拼接
+
+关键观察：三种杆塔的几何形状相似（都是细长竖直结构），但纹理差异巨大。
+
+DCNv2的局限：
+  - 学习的是空间偏移，即"去哪里采样更有效"
+  - 三种杆塔形状相似，空间偏移量的差异不大
+  - 对纹理差异的适应仅靠Δm_k（调制标量），能力有限
+  - 优势场景：目标形变大的检测任务（如不同姿态的行人）
+
+ODConv的优势：
+  - 学习的是卷积核权重调制，即"用什么特征提取器"
+  - 对水泥杆：可以学习强调粗糙纹理的卷积核
+  - 对木质杆：可以学习强调木纹方向的卷积核
+  - 对角钢塔：可以学习强调金属边缘的卷积核
+  - 优势场景：同一位置不同材质的纹理判别
+
+【结论：选择ODConv，但需注意风险】
+
+选择理由：
+  1. 问题匹配：材质差异是纹理问题而非几何问题，ODConv直接调制权重更匹配
+  2. 工程可行：纯PyTorch实现，无需编译CUDA算子，服务器移植风险低
+  3. 学术价值：ICLR 2022较新，在输电走廊分割中应用少，有一定创新性
+
+需要注意的风险：
+  1. ODConv引入4个注意力分支，参数量和计算量增加（约+30% FLOPs在layer3/4）
+  2. 训练初期ODConv注意力从零开始学习，可能导致loss波动
+  3. ODConv在语义分割中的大规模验证不如DCNv2充分
+  4. 如果ODConv效果不理想，应考虑切换为DCNv2做对比实验
+
+DCNv2作为备选方案的理由：
+  1. 更成熟，大量分割SOTA工作使用（DeepLab v3+, HRNet等）
+  2. 即使对纹理问题，空间偏移仍有一定帮助（采样到更显著的纹理区域）
+  3. 参数量增加较少（offset分支约+2×k²×C_in参数）
+
+建议：先用ODConv训练一版，观察水泥杆/木质杆的IoU变化。
+     如果效果不显著，再切换DCNv2做对比实验，以实验结果为准。
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+  修改三：ODConv代码实现
+  日期：2026-05-16
+  文件：models/model_utils.py, models/pidnet.py
+  目的：将ODConv集成到PIDNet中，替换I分支layer3/layer4的conv2
+================================================================================
+
+【1】models/model_utils.py — 新增 ODConv2d 类
+
+位置：StripPooling类之后
+
+代码：
+class ODConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, reduction=16):
+        super(ODConv2d, self).__init__()
+        self.stride = stride
+        self.padding = padding
+
+        # 静态卷积核：标准Kaiming初始化，可从预训练权重加载
+        self.weight = nn.Parameter(torch.Tensor(out_channels, in_channels, kernel_size, kernel_size))
+        nn.init.kaiming_normal_(self.weight, mode='fan_out', nonlinearity='relu')
+
+        mid = max(in_channels // reduction, 8)  # 注意力中间维度，最小为8
+
+        # 3个注意力分支（空间、输入通道、输出通道）
+        # 注：原始ODConv论文含第4个"kernel attention"，但单静态核场景下
+        # att_kernel与att_out在数学上完全等价（同为(N,C_out,1,1)乘性调制），
+        # 故精简为3个分支，去除冗余参数。
+        self.att_spatial = nn.Sequential(       # 空间注意力：输出 (N, k*k, 1, 1)
+            nn.AdaptiveAvgPool2d(1),            #   全局平均池化，压缩空间维度
+            nn.Conv2d(in_channels, mid, 1, bias=False),  # 降维
+            nn.BatchNorm2d(mid, momentum=bn_mom),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, kernel_size * kernel_size, 1), # 升维至k*k（3x3=9）
+        )
+        self.att_in = nn.Sequential(            # 输入通道注意力：输出 (N, C_in, 1, 1)
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, mid, 1, bias=False),
+            nn.BatchNorm2d(mid, momentum=bn_mom),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, in_channels, 1),     # 升维至C_in
+        )
+        self.att_out = nn.Sequential(           # 输出通道注意力：输出 (N, C_out, 1, 1)
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, mid, 1, bias=False),
+            nn.BatchNorm2d(mid, momentum=bn_mom),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, out_channels, 1),    # 升维至C_out
+        )
+        # 零初始化：所有注意力分支最后一层conv的weight和bias均设为0
+        # → sigmoid(0) = 0.5 → 初始时所有注意力值为0.5
+        # → dynamic_weight = 0.5 × static_weight
+        # → ODConv初始等效于0.5倍静态卷积核，配合残差连接保持训练稳定性
+        nn.init.constant_(self.att_spatial[-1].bias, 0)
+        nn.init.constant_(self.att_in[-1].bias, 0)
+        nn.init.constant_(self.att_out[-1].bias, 0)
+        nn.init.zeros_(self.att_spatial[-1].weight)
+        nn.init.zeros_(self.att_in[-1].weight)
+        nn.init.zeros_(self.att_out[-1].weight)
+
+    def forward(self, x):
+        N = x.size(0)
+        # 3个注意力分支并行计算，view重塑为可广播的5D形状
+        a_s = torch.sigmoid(self.att_spatial(x)).view(N, 1, 1, self.weight.size(2), self.weight.size(3))  # (N,1,1,k,k)
+        a_c = torch.sigmoid(self.att_in(x)).view(N, 1, x.size(1), 1, 1)                                   # (N,1,C_in,1,1)
+        a_f = torch.sigmoid(self.att_out(x)).view(N, self.weight.size(0), 1, 1, 1)                         # (N,C_out,1,1,1)
+
+        # 3D广播乘法：(N,C_out,1,1,1) * (N,1,C_in,1,1) * (N,1,1,k,k) → (N, C_out, C_in, k, k)
+        w = a_f * a_c * a_s
+        dynamic_weight = self.weight.unsqueeze(0) * w  # (N, C_out, C_in, k, k)
+
+        # 逐样本卷积：group conv trick（groups=N，每个样本独立卷积）
+        x_group = x.reshape(1, N * x.size(1), x.size(2), x.size(3))
+        w_group = dynamic_weight.reshape(-1, dynamic_weight.size(2), dynamic_weight.size(3), dynamic_weight.size(4))
+        out = F.conv2d(x_group, w_group, bias=None, stride=self.stride, padding=self.padding, groups=N)
+        out = out.reshape(N, -1, out.size(2), out.size(3))
+        return out
+
+解释：
+  - 3个注意力分支分别控制：空间位置、输入通道、输出通道
+  - 去除att_kernel的原因：单静态核场景下，att_kernel(N,C_out,1,1)与att_out(N,C_out,1,1)
+    在数学上完全等价（两者都是对C_out维的乘性调制），保留两者是冗余参数
+  - 所有注意力共享同一个GAP→FC结构，但输出维度不同
+  - sigmoid将注意力值限制在(0,1)，作为静态核的乘性调制
+  - view重塑为5D形状，利用广播机制直接相乘得到(N,C_out,C_in,k,k)调制权重
+  - group conv trick：将batch维和通道维合并，用groups=N实现逐样本卷积
+    避免显式循环，利用PyTorch原生conv2d的高效实现
+
+【2】models/model_utils.py — 新增 ODConvBasicBlock 类
+
+位置：ODConv2d类之后
+
+代码：
+class ODConvBasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None, no_relu=False):
+        super(ODConvBasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=3, stride=stride,
+                               padding=1, bias=False)           # conv1保持标准3x3卷积
+        self.bn1 = BatchNorm2d(planes, momentum=bn_mom)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = ODConv2d(planes, planes, kernel_size=3, stride=1, padding=1)  # conv2替换为ODConv
+        self.bn2 = BatchNorm2d(planes, momentum=bn_mom)
+        self.downsample = downsample
+        self.stride = stride
+        self.no_relu = no_relu
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)       # ODConv2d：4D注意力动态调制卷积核
+        out = self.bn2(out)
+        if self.downsample is not None:
+            residual = self.downsample(x)
+        out += residual             # 残差连接
+        if self.no_relu:
+            return out
+        else:
+            return self.relu(out)
+
+解释：
+  - 与原始BasicBlock接口完全一致（构造函数签名相同，expansion=1）
+  - 仅conv2从nn.Conv2d替换为ODConv2d，其余不变
+  - _make_layer方法可直接复用，无需修改
+  - 预训练权重加载：conv1/bn1/bn2可直接映射，ODConv2d的静态核可从原conv2加载，
+    4个注意力分支为新增参数，不在预训练权重中，由Kaiming初始化
+
+【3】models/pidnet.py — I分支layer3/layer4使用ODConvBasicBlock
+
+修改1 — 第8行，import添加ODConvBasicBlock：
+  原：from .model_utils import BasicBlock, Bottleneck, segmenthead, DAPPM, PAPPM, PagFM, Bag, Light_Bag, StripPooling
+  改：from .model_utils import BasicBlock, Bottleneck, segmenthead, DAPPM, PAPPM, PagFM, Bag, Light_Bag, StripPooling, ODConvBasicBlock
+
+修改2 — 第36-37行附近，__init__中layer3/layer4替换：
+  原：self.layer3 = self._make_layer(BasicBlock, planes * 2, planes * 4, n, stride=2)
+      self.layer4 = self._make_layer(BasicBlock, planes * 4, planes * 8, n, stride=2)
+  改：self.layer3 = self._make_layer(ODConvBasicBlock, planes * 2, planes * 4, n, stride=2)
+      self.layer4 = self._make_layer(ODConvBasicBlock, planes * 4, planes * 8, n, stride=2)
+
+解释：
+  - 仅替换I分支的layer3和layer4（最深层语义特征，纹理信息最丰富）
+  - 以下部分保持不变：
+    * layer1、layer2：浅层特征（边缘/纹理基元），不需要材质自适应
+    * layer5：Bottleneck使用1x1卷积，ODConv针对3x3空间卷积
+    * P分支（layer3_, layer4_, layer5_）：高分辨率细节分支，处理线的走向
+    * D分支（layer3_d, layer4_d, layer5_d）：边缘检测分支
+    * SPM：条形池化模块，增强方向性上下文
+    * Bag/Light_Bag：P/I分支融合模块
+
+【预训练权重兼容性】
+  get_seg_model()中使用strict=False加载预训练权重：
+  - conv1、bn1、bn2：形状与原BasicBlock一致，直接加载
+  - ODConv2d.weight：形状与原conv2.weight一致，直接加载
+  - att_spatial/att_in/att_out：新增参数，不在预训练权重中，自动跳过
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+  验证脚本使用说明
+================================================================================
+
+  SPM验证：python verify_spm.py（6层测试）
+  ODConv验证：python verify_odconv.py（6层测试）
+
+  注意：本机未安装PyTorch，需在A100服务器上运行。
+
+  服务器同步文件清单：
+    models/model_utils.py  （含StripPooling + ODConv2d + ODConvBasicBlock）
+    models/pidnet.py       （含SPM和ODConv集成）
+    verify_spm.py
+    verify_odconv.py
+    configs/power/pidnet_large_a100_v2.yaml
+
+================================================================================
